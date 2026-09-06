@@ -489,6 +489,8 @@ pub struct DaemonState {
     /// so they never block the agent.
     dialog_handler_task: Option<tokio::task::JoinHandle<()>>,
     pub mouse_state: MouseState,
+    /// Session-wide pointer behavior, configured by `--input-mode`.
+    pub input_mode: String,
     /// Tracks the currently open JavaScript dialog (alert/confirm/prompt), if any.
     pub pending_dialog: Option<PendingDialog>,
     /// A mouse button left logically down because a dialog opened between
@@ -612,6 +614,7 @@ impl DaemonState {
             fetch_handler_task: None,
             dialog_handler_task: None,
             mouse_state: MouseState::default(),
+            input_mode: "instant".to_string(),
             pending_dialog: None,
             pending_pointer_release: None,
             auto_dialog: !matches!(
@@ -2377,6 +2380,11 @@ fn policy_actions_for_command(
 
 pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(mode @ ("instant" | "smooth" | "human")) =
+        cmd.get("inputMode").and_then(Value::as_str)
+    {
+        state.input_mode = mode.to_string();
+    }
     let id = cmd
         .get("id")
         .and_then(|v| v.as_str())
@@ -5396,6 +5404,34 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
     let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+
+    let input_mode = cmd
+        .get("inputMode")
+        .and_then(Value::as_str)
+        .unwrap_or(&state.input_mode);
+    if input_mode != "instant" {
+        let (x, y, target_session_id) = super::element::resolve_element_center(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            &state.iframe_sessions,
+        )
+        .await?;
+        move_mouse_interpolated(
+            &mgr.client,
+            &target_session_id,
+            &mut state.mouse_state,
+            x,
+            y,
+            if input_mode == "smooth" { 200 } else { 0 },
+            None,
+            input_mode == "human",
+            cmd.get("seed").and_then(Value::as_u64).unwrap_or(0),
+            0,
+        )
+        .await?;
+    }
 
     let result = interaction::click(
         &mgr.client,
@@ -9793,14 +9829,27 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     )
     .await?;
 
-    // Mouse down at source
-    mgr.client
-        .send_command(
-            "Input.dispatchMouseEvent",
-            Some(json!({ "type": "mouseMoved", "x": sx, "y": sy })),
-            Some(&source_session_id),
-        )
-        .await?;
+    let mode = cmd
+        .get("inputMode")
+        .and_then(Value::as_str)
+        .unwrap_or(&state.input_mode);
+    let human = mode == "human";
+    let seed = cmd.get("seed").and_then(Value::as_u64).unwrap_or(0);
+
+    // Approach the source before pressing so hover and pointer path handlers fire.
+    move_mouse_interpolated(
+        &mgr.client,
+        &source_session_id,
+        &mut state.mouse_state,
+        sx,
+        sy,
+        0,
+        if human { None } else { Some(1) },
+        human,
+        seed,
+        0,
+    )
+    .await?;
     mgr.client
         .send_command(
             "Input.dispatchMouseEvent",
@@ -9811,19 +9860,22 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
 
     // Move in steps to target, keeping the left button held (buttons: 1) so
     // that the browser sees a drag rather than a plain pointer move.
-    let steps = 10;
-    for i in 1..=steps {
-        let cx = sx + (tx - sx) * (i as f64) / (steps as f64);
-        let cy = sy + (ty - sy) * (i as f64) / (steps as f64);
-        mgr.client
-            .send_command(
-                "Input.dispatchMouseEvent",
-                Some(json!({ "type": "mouseMoved", "x": cx, "y": cy, "button": "left", "buttons": 1 })),
-                Some(&target_session_id),
-            )
-            .await?;
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    }
+    state.mouse_state.x = sx;
+    state.mouse_state.y = sy;
+    state.mouse_state.buttons = 1;
+    move_mouse_interpolated(
+        &mgr.client,
+        &target_session_id,
+        &mut state.mouse_state,
+        tx,
+        ty,
+        if human { 250 } else { 100 },
+        if human { None } else { Some(10) },
+        human,
+        seed.wrapping_add(1),
+        1,
+    )
+    .await?;
 
     // Mouse up at target
     mgr.client
@@ -9833,6 +9885,7 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
             Some(&target_session_id),
         )
         .await?;
+    state.mouse_state.buttons = 0;
 
     Ok(json!({ "dragged": true, "source": source, "target": target }))
 }
@@ -11948,28 +12001,137 @@ async fn handle_inserttext(cmd: &Value, state: &DaemonState) -> Result<Value, St
     Ok(json!({ "inserted": true }))
 }
 
+/// Move the session cursor along a deterministic eased curve. Human mode adds
+/// a seeded perpendicular bend while preserving exact, reproducible endpoints.
+#[allow(clippy::too_many_arguments)]
+async fn move_mouse_interpolated(
+    client: &CdpClient,
+    session_id: &str,
+    mouse_state: &mut MouseState,
+    target_x: f64,
+    target_y: f64,
+    duration_ms: u64,
+    requested_steps: Option<usize>,
+    human: bool,
+    seed: u64,
+    buttons: i32,
+) -> Result<(), String> {
+    let start_x = mouse_state.x;
+    let start_y = mouse_state.y;
+    let dx = target_x - start_x;
+    let dy = target_y - start_y;
+    let distance = dx.hypot(dy);
+    let duration_ms = if duration_ms == 0 && human {
+        (80.0 + distance * 0.35).clamp(100.0, 700.0) as u64
+    } else {
+        duration_ms
+    };
+    let steps = requested_steps
+        .unwrap_or_else(|| ((distance / 12.0).ceil() as usize).clamp(1, 60))
+        .clamp(1, 240);
+    let bend = if human && distance > 0.0 {
+        let mixed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let unit = ((mixed >> 11) as f64) / ((1_u64 << 53) as f64);
+        (unit * 2.0 - 1.0) * (distance * 0.08).min(36.0)
+    } else {
+        0.0
+    };
+    let (perp_x, perp_y) = if distance > 0.0 {
+        (-dy / distance, dx / distance)
+    } else {
+        (0.0, 0.0)
+    };
+    let delay = if duration_ms == 0 {
+        None
+    } else {
+        Some(tokio::time::Duration::from_micros(
+            duration_ms.saturating_mul(1000) / steps as u64,
+        ))
+    };
+
+    for i in 1..=steps {
+        let (x, y) = interpolated_mouse_point(
+            start_x, start_y, target_x, target_y, perp_x, perp_y, bend, i, steps,
+        );
+        let params = build_mouse_event_params(
+            mouse_state,
+            "mouseMoved",
+            Some(x),
+            Some(y),
+            None,
+            Some(buttons),
+            None,
+            None,
+            None,
+            None,
+        );
+        client
+            .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(session_id))
+            .await?;
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interpolated_mouse_point(
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+    perp_x: f64,
+    perp_y: f64,
+    bend: f64,
+    step: usize,
+    steps: usize,
+) -> (f64, f64) {
+    if step == steps {
+        return (target_x, target_y);
+    }
+    let t = step as f64 / steps as f64;
+    let eased = t * t * (3.0 - 2.0 * t);
+    let curve = 4.0 * t * (1.0 - t) * bend;
+    (
+        start_x + (target_x - start_x) * eased + perp_x * curve,
+        start_y + (target_y - start_y) * eased + perp_y * curve,
+    )
+}
+
 async fn handle_mousemove(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let x = cmd.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let y = cmd.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let params = build_mouse_event_params(
+    let duration = cmd.get("duration").and_then(Value::as_u64).unwrap_or(0);
+    let mut steps = cmd.get("steps").and_then(Value::as_u64).map(|v| v as usize);
+    let mode = cmd
+        .get("inputMode")
+        .and_then(Value::as_str)
+        .unwrap_or(&state.input_mode);
+    let human = mode == "human";
+    if mode == "instant" && duration == 0 && steps.is_none() {
+        steps = Some(1);
+    }
+    let seed = cmd.get("seed").and_then(Value::as_u64).unwrap_or(0);
+    let buttons = state.mouse_state.buttons;
+    move_mouse_interpolated(
+        &mgr.client,
+        &session_id,
         &mut state.mouse_state,
-        "mouseMoved",
-        Some(x),
-        Some(y),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-
-    mgr.client
-        .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(&session_id))
-        .await?;
-    Ok(json!({ "moved": true }))
+        x,
+        y,
+        duration,
+        steps,
+        human,
+        seed,
+        buttons,
+    )
+    .await?;
+    Ok(json!({ "moved": true, "x": x, "y": y }))
 }
 
 async fn handle_mousedown(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -13819,6 +13981,14 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
         drop(listener);
         let _ = fs::remove_dir_all(&socket_dir);
+    }
+
+    #[test]
+    fn interpolated_mouse_path_uses_easing_and_exact_endpoint() {
+        let midpoint = interpolated_mouse_point(0.0, 0.0, 100.0, 0.0, 0.0, 1.0, 10.0, 1, 2);
+        assert_eq!(midpoint, (50.0, 10.0));
+        let endpoint = interpolated_mouse_point(0.0, 0.0, 100.0, 0.0, 0.0, 1.0, 10.0, 2, 2);
+        assert_eq!(endpoint, (100.0, 0.0));
     }
 
     #[test]

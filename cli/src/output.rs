@@ -1645,6 +1645,7 @@ Options:
   --new-tab            Open link in a new tab instead of navigating current tab
                        (only works on elements with href attribute)
   --human              Approach along a reproducible eased curve
+                       Starts at the last pointer or element interaction
 
 Global Options:
   --json               Output as JSON

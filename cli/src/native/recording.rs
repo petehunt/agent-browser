@@ -39,6 +39,10 @@ const CONTACT_SHEET_MIN_TILE_PIXELS: u32 = 4;
 const CONTACT_SHEET_MIN_REGION_PIXELS: u64 = 8;
 const CONTACT_SHEET_REGION_PADDING_TILES: u32 = 1;
 const CONTACT_SHEET_REGION_MERGE_GAP_TILES: u32 = 4;
+const CONTACT_SHEET_BURST_WINDOW_MS: u64 = 1_000;
+const CONTACT_SHEET_BURST_RATE: usize = 25;
+const CONTACT_SHEET_BURST_QUIET_MS: u64 = 250;
+const CONTACT_SHEET_BURST_FRAMES: usize = 7;
 
 /// Rate above which the live encoder uses additional threads.
 const HIGH_FPS_THRESHOLD: u32 = 30;
@@ -582,11 +586,12 @@ fn build_ffmpeg_command(output_path: &str, fps: u32, cursor: bool) -> tokio::pro
     cmd
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ContactSheetFrame {
     source: Arc<image::RgbImage>,
     image_data: Vec<u8>,
     elapsed_ms: u64,
+    change_ratio: f64,
     cursor: RecordingCursorState,
     device_width: f64,
     device_height: f64,
@@ -597,6 +602,26 @@ struct ContactSheetCell {
     elapsed_ms: u64,
 }
 
+struct StoredContactSheetFrame {
+    image_data: Vec<u8>,
+    elapsed_ms: u64,
+    cursor: RecordingCursorState,
+    device_width: f64,
+    device_height: f64,
+}
+
+impl From<ContactSheetFrame> for StoredContactSheetFrame {
+    fn from(frame: ContactSheetFrame) -> Self {
+        Self {
+            image_data: frame.image_data,
+            elapsed_ms: frame.elapsed_ms,
+            cursor: frame.cursor,
+            device_width: frame.device_width,
+            device_height: frame.device_height,
+        }
+    }
+}
+
 struct ContactSheetBaseline {
     source: Arc<image::RgbImage>,
     preview: image::RgbImage,
@@ -604,8 +629,10 @@ struct ContactSheetBaseline {
 
 struct ContactSheetCollector {
     threshold: f64,
-    selected: Vec<ContactSheetCell>,
-    previous_selected: Option<ContactSheetBaseline>,
+    selected: Vec<StoredContactSheetFrame>,
+    pending: Vec<ContactSheetFrame>,
+    burst: bool,
+    previous_candidate: Option<ContactSheetBaseline>,
     latest: Option<ContactSheetFrame>,
     cell_height: Option<u32>,
 }
@@ -615,9 +642,76 @@ impl ContactSheetCollector {
         Self {
             threshold,
             selected: Vec::new(),
-            previous_selected: None,
+            pending: Vec::new(),
+            burst: false,
+            previous_candidate: None,
             latest: None,
             cell_height: None,
+        }
+    }
+
+    fn flush_pending(&mut self) {
+        let remaining = (MAX_CONTACT_SHEET_FRAMES - 1).saturating_sub(self.selected.len());
+        self.selected.extend(
+            self.pending
+                .drain(..)
+                .take(remaining)
+                .map(StoredContactSheetFrame::from),
+        );
+        self.burst = false;
+    }
+
+    fn flush_if_quiet(&mut self, elapsed_ms: u64) {
+        if self.pending.last().is_some_and(|last| {
+            elapsed_ms.saturating_sub(last.elapsed_ms) >= CONTACT_SHEET_BURST_QUIET_MS
+        }) {
+            self.flush_pending();
+        }
+    }
+
+    fn compact_pending_burst(&mut self) {
+        while self.pending.len() > CONTACT_SHEET_BURST_FRAMES {
+            let remove = (1..self.pending.len() - 1)
+                .min_by(|&a, &b| {
+                    let score = |index: usize| {
+                        let span = self.pending[index + 1]
+                            .elapsed_ms
+                            .saturating_sub(self.pending[index - 1].elapsed_ms)
+                            as f64;
+                        span * (1.0 + self.pending[index].change_ratio)
+                    };
+                    score(a)
+                        .partial_cmp(&score(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .expect("a burst with more than two frames has an interior frame");
+            self.pending.remove(remove);
+        }
+    }
+
+    fn stage_candidate(&mut self, frame: ContactSheetFrame) {
+        self.flush_if_quiet(frame.elapsed_ms);
+        self.pending.push(frame);
+
+        if self.burst {
+            self.compact_pending_burst();
+            return;
+        }
+
+        let latest_ms = self.pending.last().map_or(0, |latest| latest.elapsed_ms);
+        while self.pending.first().is_some_and(|first| {
+            latest_ms.saturating_sub(first.elapsed_ms) > CONTACT_SHEET_BURST_WINDOW_MS
+        }) {
+            if self.selected.len() < MAX_CONTACT_SHEET_FRAMES - 1 {
+                self.selected.push(self.pending.remove(0).into());
+            } else {
+                self.pending.remove(0);
+            }
+        }
+
+        if self.pending.len() > CONTACT_SHEET_BURST_RATE {
+            self.burst = true;
+            self.compact_pending_burst();
         }
     }
 
@@ -629,13 +723,15 @@ impl ContactSheetCollector {
         device_width: f64,
         device_height: f64,
     ) {
+        let elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        self.flush_if_quiet(elapsed_ms);
         // Encoded equality is only a shortcut; selection compares decoded pixels.
         if let Some(latest) = self
             .latest
             .as_mut()
             .filter(|frame| frame.image_data == image_data)
         {
-            latest.elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+            latest.elapsed_ms = elapsed_ms;
             latest.cursor = cursor;
             latest.device_width = device_width;
             latest.device_height = device_height;
@@ -655,7 +751,7 @@ impl ContactSheetCollector {
             .thumbnail_exact(preview_width, preview_height)
             .into_rgb8();
         let source = Arc::new(source.into_rgb8());
-        let cell_height = *self.cell_height.get_or_insert_with(|| {
+        self.cell_height.get_or_insert_with(|| {
             ((CONTACT_SHEET_CELL_WIDTH as f64 * source.height() as f64
                 / source.width().max(1) as f64)
                 .round() as u32)
@@ -664,30 +760,26 @@ impl ContactSheetCollector {
         let frame = ContactSheetFrame {
             source,
             image_data: image_data.to_vec(),
-            elapsed_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
+            elapsed_ms,
+            change_ratio: 0.0,
             cursor,
             device_width,
             device_height,
         };
-        // Reserve one slot for the final frame. Compare with the last selected
-        // cell so small changes accumulate instead of disappearing.
-        let selected = self.selected.len() < MAX_CONTACT_SHEET_FRAMES - 1
-            && self.previous_selected.as_ref().is_none_or(|previous| {
-                if previous.source.dimensions() != frame.source.dimensions() {
-                    return true;
-                }
-                let ratio = changed_pixel_ratio(&previous.preview, &preview);
-                ratio > 0.0 && ratio >= self.threshold
-            });
-        if selected {
-            self.selected.push(render_contact_cell(
-                &frame,
-                self.previous_selected
-                    .as_ref()
-                    .map(|previous| previous.source.as_ref()),
-                cell_height,
-            ));
-            self.previous_selected = Some(ContactSheetBaseline {
+        // Reserve one slot for the final frame. Compare with the last candidate
+        // so small changes accumulate instead of disappearing.
+        let change_ratio = self.previous_candidate.as_ref().map_or(1.0, |previous| {
+            if previous.source.dimensions() != frame.source.dimensions() {
+                1.0
+            } else {
+                changed_pixel_ratio(&previous.preview, &preview)
+            }
+        });
+        if change_ratio > 0.0 && change_ratio >= self.threshold {
+            let mut candidate = frame.clone();
+            candidate.change_ratio = change_ratio;
+            self.stage_candidate(candidate);
+            self.previous_candidate = Some(ContactSheetBaseline {
                 source: frame.source.clone(),
                 preview,
             });
@@ -695,25 +787,44 @@ impl ContactSheetCollector {
         self.latest = Some(frame);
     }
 
-    fn finish(mut self) -> Vec<ContactSheetCell> {
+    fn finish_frames(mut self) -> Vec<StoredContactSheetFrame> {
+        self.flush_pending();
         if let Some(latest) = self.latest {
             let already_selected = self
                 .selected
                 .last()
                 .is_some_and(|frame| frame.elapsed_ms == latest.elapsed_ms);
             if !already_selected {
-                // Only the terminal candidate is finalized here; every selected
-                // cell has already been rendered while consuming the stream.
-                self.selected.push(render_contact_cell(
-                    &latest,
-                    self.previous_selected
-                        .as_ref()
-                        .map(|previous| previous.source.as_ref()),
-                    self.cell_height.unwrap_or(1),
-                ));
+                self.selected.push(latest.into());
             }
         }
         self.selected
+    }
+
+    fn finish(self) -> Vec<ContactSheetCell> {
+        let cell_height = self.cell_height.unwrap_or(1);
+        let frames = self.finish_frames();
+        let mut previous: Option<Arc<image::RgbImage>> = None;
+        frames
+            .into_iter()
+            .map(|stored| {
+                let source = image::load_from_memory(&stored.image_data)
+                    .expect("selected frame was decoded during selection")
+                    .into_rgb8();
+                let frame = ContactSheetFrame {
+                    source: Arc::new(source),
+                    image_data: stored.image_data,
+                    elapsed_ms: stored.elapsed_ms,
+                    change_ratio: 0.0,
+                    cursor: stored.cursor,
+                    device_width: stored.device_width,
+                    device_height: stored.device_height,
+                };
+                let cell = render_contact_cell(&frame, previous.as_deref(), cell_height);
+                previous = Some(frame.source.clone());
+                cell
+            })
+            .collect()
     }
 }
 
@@ -1360,15 +1471,16 @@ fn collect_contact_frames(
             return Err("Contact sheet analysis fell more than 500 ms behind capture".to_string());
         }
     }
+    let frames = collector.finish();
     if std::env::var_os("AGENT_BROWSER_DEBUG").is_some() {
         eprintln!(
             "[contact-sheet] processed={} max_analysis_lag_ms={:.3} rendered_cells={}",
             processed,
             max_lag.as_secs_f64() * 1000.0,
-            collector.selected.len()
+            frames.len()
         );
     }
-    Ok(collector.finish())
+    Ok(frames)
 }
 
 async fn write_encoder_bytes(
@@ -1773,7 +1885,7 @@ mod tests {
         }
         assert_eq!(
             collector
-                .previous_selected
+                .previous_candidate
                 .as_ref()
                 .map(|previous| previous.source.as_ref()),
             Some(&clean)
@@ -2023,11 +2135,10 @@ mod tests {
             );
         }
         assert_eq!(
-            collector.selected.len(),
+            collector.finish().len(),
             3,
-            "subtle loading transitions must be selected before shutdown"
+            "subtle loading transitions must be selected"
         );
-        assert_eq!(collector.finish().len(), 3);
     }
 
     #[test]
@@ -2065,7 +2176,6 @@ mod tests {
                 720.0,
             );
         }
-        assert_eq!(collector.selected.len(), 2);
         assert_eq!(collector.finish().len(), 2);
     }
 
@@ -2106,22 +2216,74 @@ mod tests {
             30,
         );
         send(base, 40);
+        let frames = collector.finish();
         assert_eq!(
-            collector
-                .selected
+            frames
                 .iter()
                 .map(|frame| frame.elapsed_ms)
                 .collect::<Vec<_>>(),
             vec![0, 20, 30, 40]
         );
         assert!(
-            collector
-                .selected
+            frames
                 .iter()
                 .all(|frame| frame.rendered.width() == CONTACT_SHEET_CELL_WIDTH),
-            "selected cells must be rendered before shutdown"
+            "selected cells must be rendered"
         );
-        assert_eq!(collector.finish().len(), 4);
+    }
+
+    #[test]
+    fn test_contact_sheet_compacts_high_rate_scroll_burst() {
+        let mut collector = ContactSheetCollector::new(0.01);
+        let mut last_png = Vec::new();
+        for index in 0..=60u32 {
+            let source = image::RgbImage::from_fn(100, 60, |x, y| {
+                let document_y = y + index * 8;
+                let band = ((document_y / 12) % 6) as u8;
+                image::Rgb([
+                    band.saturating_mul(35),
+                    (x as u8).wrapping_add(band.saturating_mul(11)),
+                    255u8.saturating_sub(band.saturating_mul(25)),
+                ])
+            });
+            let mut png = Vec::new();
+            image::DynamicImage::ImageRgb8(source)
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .unwrap();
+            collector.consider(
+                &png,
+                Duration::from_millis(index as u64 * 16),
+                RecordingCursorState::default(),
+                100.0,
+                60.0,
+            );
+            last_png = png;
+        }
+        // A held frame ends the burst and must still become the final cell.
+        collector.consider(
+            &last_png,
+            Duration::from_millis(1_300),
+            RecordingCursorState::default(),
+            100.0,
+            60.0,
+        );
+
+        let frames = collector.finish_frames();
+        let timestamps = frames
+            .iter()
+            .map(|frame| frame.elapsed_ms)
+            .collect::<Vec<_>>();
+        assert_eq!(timestamps.first(), Some(&0));
+        assert_eq!(timestamps.last(), Some(&1_300));
+        assert!(timestamps.len() <= CONTACT_SHEET_BURST_FRAMES + 1);
+        assert!(
+            timestamps
+                .iter()
+                .filter(|&&time| time > 0 && time < 960)
+                .count()
+                >= 3,
+            "the compacted scroll should retain representative middle frames"
+        );
     }
 
     #[test]

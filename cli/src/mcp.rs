@@ -136,6 +136,7 @@ const TOOL_DIFF_SNAPSHOT: &str = "agent_browser_diff_snapshot";
 const TOOL_DIFF_SCREENSHOT: &str = "agent_browser_diff_screenshot";
 const TOOL_DIFF_URL: &str = "agent_browser_diff_url";
 const TOOL_BATCH: &str = "agent_browser_batch";
+const TOOL_ACT: &str = "agent_browser_act";
 const TOOL_REACT_TREE: &str = "agent_browser_react_tree";
 const TOOL_REACT_INSPECT: &str = "agent_browser_react_inspect";
 const TOOL_REACT_RENDERS_START: &str = "agent_browser_react_renders_start";
@@ -355,6 +356,7 @@ const CORE_PROFILE_TOOLS: &[&str] = &[
     TOOL_WAIT_FOR_TEXT,
     TOOL_WAIT_FOR_LOAD,
     TOOL_SCREENSHOT,
+    TOOL_ACT,
     TOOL_GET_TEXT,
     TOOL_GET_URL,
     TOOL_GET_TITLE,
@@ -1602,6 +1604,18 @@ fn parity_tools() -> Vec<Value> {
             &["commands"],
         ),
         tool(
+            TOOL_ACT,
+            "Act and observe",
+            "Run multiple actions atomically and capture final page state once.",
+            json!({
+                "commands": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                "wait": { "type": "string", "enum": ["load", "domcontentloaded", "networkidle"] },
+                "observe": { "type": "string", "enum": ["full", "delta"] },
+                "screenshotIfChanged": { "type": "boolean" }
+            }),
+            &["commands"],
+        ),
+        tool(
             TOOL_REACT_TREE,
             "React tree",
             "Inspect React tree.",
@@ -2208,6 +2222,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_WAIT_FOR_FUNCTION => call_wait_flag(arguments, Some("--fn"), "expression"),
         TOOL_WAIT_FOR_DOWNLOAD => call_wait_download(arguments),
         TOOL_SCREENSHOT => call_screenshot(arguments),
+        TOOL_ACT => call_act(arguments),
         TOOL_PDF => call_one_string(arguments, "pdf", "path"),
         TOOL_GET_TEXT => call_get_selector(arguments, "text"),
         TOOL_GET_HTML => call_get_selector(arguments, "html"),
@@ -3300,6 +3315,33 @@ fn call_batch(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, Some(stdin))
 }
 
+fn act_command_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
+    let commands = required_string_array(arguments, "commands")?;
+    if commands.is_empty() {
+        return Err(ProtocolError::invalid_params(
+            "commands must contain at least one action",
+        ));
+    }
+    let mut args = vec!["act".to_string()];
+    args.extend(commands);
+    if let Some(wait) = optional_string(arguments, "wait")? {
+        args.push("--wait".to_string());
+        args.push(wait);
+    }
+    if let Some(observe) = optional_string(arguments, "observe")? {
+        args.push("--observe".to_string());
+        args.push(observe);
+    }
+    if optional_bool(arguments, "screenshotIfChanged")?.unwrap_or(false) {
+        args.push("--screenshot-if-changed".to_string());
+    }
+    Ok(args)
+}
+
+fn call_act(arguments: &Value) -> Result<Value, ProtocolError> {
+    call_cli_tool(arguments, act_command_args(arguments)?, None)
+}
+
 fn call_react_tree(arguments: &Value) -> Result<Value, ProtocolError> {
     let mut args = vec!["react".to_string(), "tree".to_string()];
     append_react_raw_json_arg(arguments, &mut args)?;
@@ -3951,7 +3993,11 @@ fn response_text(value: &Value) -> Option<String> {
 }
 
 fn image_content_from_response(value: &Value) -> Option<Value> {
-    let path = value.get("data")?.get("path")?.as_str()?;
+    let data = value.get("data")?;
+    let path = data
+        .get("path")
+        .and_then(Value::as_str)
+        .or_else(|| data.pointer("/screenshot/path").and_then(Value::as_str))?;
     let mime_type = image_mime_type(path)?;
     let metadata = fs::metadata(path).ok()?;
     if metadata.len() > MAX_IMAGE_BYTES {
@@ -4342,6 +4388,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(args, vec!["click", "@e1", "--new-tab"]);
+    }
+
+    #[test]
+    fn act_command_args_preserve_cli_parity() {
+        let args = act_command_args(&json!({
+            "commands": ["fill @e1 pete", "click @e2"],
+            "wait": "networkidle",
+            "observe": "delta",
+            "screenshotIfChanged": true
+        }))
+        .unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "act",
+                "fill @e1 pete",
+                "click @e2",
+                "--wait",
+                "networkidle",
+                "--observe",
+                "delta",
+                "--screenshot-if-changed"
+            ]
+        );
     }
 
     #[test]

@@ -288,6 +288,16 @@ Headless Chromium screenshots hide native scrollbars for consistent image output
 
 `--annotate` is designed for multimodal models: each label `[N]` maps to ref `@eN`.
 
+### Act and observe once
+
+Use `act` to execute multiple actions and capture page state only after the sequence completes:
+
+```bash
+agent-browser act 'fill @e1 "pete@example.com"' 'click @e2' --wait networkidle --observe delta --screenshot-if-changed --json
+```
+
+Each action uses the normal parser, policy, and backend checks. Execution stops on the first failure and the response preserves individual action results. `--observe delta` returns a full tree the first time, then an unchanged result or a delta; `--observe full` forces the full tree. The response always includes the final URL when all actions succeed. Conditional screenshots omit their path when decoded pixels match the preceding `act` capture for that tab.
+
 ### Handle multiple pages via tabs
 
 ```bash

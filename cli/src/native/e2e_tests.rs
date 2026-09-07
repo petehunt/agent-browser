@@ -1092,6 +1092,73 @@ async fn e2e_snapshot_and_click_ref() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_act_executes_actions_and_observes_once() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({
+            "id": "2",
+            "action": "setcontent",
+            "html": "<input id='name'><button id='save' onclick=\"document.body.dataset.saved=document.querySelector('#name').value\">Save</button>"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "3",
+            "action": "act",
+            "actions": [
+                { "command": "fill #name pete", "request": { "action": "fill", "selector": "#name", "value": "pete" } },
+                { "command": "click #save", "request": { "action": "click", "selector": "#save" } }
+            ],
+            "observe": "delta",
+            "screenshotIfChanged": true
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let data = get_data(&resp);
+    assert_eq!(data["completed"], true);
+    assert_eq!(data["actions"].as_array().unwrap().len(), 2);
+    assert_eq!(data["snapshot"]["kind"], "full");
+    assert_eq!(data["screenshot"]["changed"], true);
+    let first_path = data["screenshot"]["path"].as_str().unwrap().to_string();
+
+    let resp = execute_command(
+        &json!({
+            "id": "4",
+            "action": "act",
+            "actions": [
+                { "command": "get url", "request": { "action": "url" } }
+            ],
+            "observe": "delta",
+            "screenshotIfChanged": true
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let data = get_data(&resp);
+    assert_eq!(data["snapshot"]["kind"], "unchanged");
+    assert_eq!(data["screenshot"]["changed"], false);
+    assert!(data["screenshot"].get("path").is_none());
+
+    let _ = std::fs::remove_file(first_path);
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_screenshot() {
     let mut state = DaemonState::new();
 

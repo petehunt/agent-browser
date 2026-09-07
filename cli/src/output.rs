@@ -1434,6 +1434,43 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
             return;
         }
 
+        if action == Some("act") {
+            if let Some(actions) = data.get("actions").and_then(|v| v.as_array()) {
+                for item in actions {
+                    let command = item.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                    let success = item.get("success").and_then(|v| v.as_bool()) == Some(true);
+                    let indicator = if success {
+                        color::success_indicator()
+                    } else {
+                        color::error_indicator()
+                    };
+                    println!("{} {}", indicator, command);
+                }
+            }
+            if let Some(url) = data.get("url").and_then(|v| v.as_str()) {
+                println!("URL: {}", url);
+            }
+            if let Some(kind) = data.pointer("/snapshot/kind").and_then(|v| v.as_str()) {
+                println!("Snapshot: {}", kind);
+            }
+            if let Some(changed) = data
+                .pointer("/screenshot/changed")
+                .and_then(|v| v.as_bool())
+            {
+                if changed {
+                    println!(
+                        "Screenshot: {}",
+                        data.pointer("/screenshot/path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("changed")
+                    );
+                } else {
+                    println!("Screenshot: unchanged");
+                }
+            }
+            return;
+        }
+
         // Default success
         println!("{} Done", color::success_indicator());
     }
@@ -3338,6 +3375,26 @@ Examples:
 "##
         }
 
+        "act" => {
+            r##"
+agent-browser act - Execute actions and observe once
+
+Usage: agent-browser act "<command>"... [options]
+
+Executes each quoted command through the normal CLI and daemon validation path, then optionally waits and captures the final URL, snapshot, and screenshot in one response. Execution stops after the first failed action while preserving results for actions already attempted.
+
+Options:
+  --wait <state>              Wait for load, domcontentloaded, or networkidle
+  --observe <full|delta>      Return a full snapshot or an incremental observation
+  --screenshot-if-changed     Return a screenshot only when decoded pixels changed
+  --json                      Output the combined result as JSON
+
+Examples:
+  agent-browser act "fill @e1 pete@example.com" "click @e2" --wait networkidle --observe delta
+  agent-browser act "click @e1" --observe full --screenshot-if-changed --json
+"##
+        }
+
         "batch" => {
             r##"
 agent-browser batch - Execute multiple commands sequentially
@@ -3782,6 +3839,7 @@ Init scripts:
 Batch:
   batch [--bail] ["cmd" ...]  Execute multiple commands sequentially (args or stdin)
                               --bail stops on first error (default: continue all)
+  act ["cmd" ...] [options]   Execute actions and capture final state once
 
 Auth Vault:
   auth save <name> [opts]    Save auth profile (--url, --username, --password/--password-stdin)

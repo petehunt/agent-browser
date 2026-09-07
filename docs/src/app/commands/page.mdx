@@ -638,6 +638,34 @@ echo '[
   </tbody>
 </table>
 
+## Action and observation batches
+
+Use `act` to execute several actions through one daemon request and capture page state once at the end. Every quoted command still uses the normal CLI parser, policy checks, and backend validation. Execution stops after the first failure while preserving individual results.
+
+```bash
+agent-browser act \
+  'fill @e1 "pete@example.com"' \
+  'fill @e2 "secret"' \
+  'click @e3' \
+  --wait networkidle \
+  --observe delta \
+  --screenshot-if-changed \
+  --json
+```
+
+<table>
+  <thead>
+    <tr><th>Option</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>--wait &lt;state&gt;</code></td><td>Wait for <code>load</code>, <code>domcontentloaded</code>, or <code>networkidle</code> after the actions</td></tr>
+    <tr><td><code>--observe &lt;full|delta&gt;</code></td><td>Return a full snapshot or an incremental observation</td></tr>
+    <tr><td><code>--screenshot-if-changed</code></td><td>Return a screenshot path only when decoded pixels changed for the active tab</td></tr>
+  </tbody>
+</table>
+
+The result always includes the final URL after successful actions. Delta observation returns a full tree on the first call, a compact unchanged response when the tree matches, and a delta otherwise.
+
 ## MCP server
 
 ```bash

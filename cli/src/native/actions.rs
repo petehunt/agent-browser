@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -533,6 +534,10 @@ pub struct DaemonState {
     pub pin_tab: bool,
     /// Last binding written to disk, so persistence is write-on-change.
     last_persisted_binding: Option<tab_binding::TabBinding>,
+    /// Last action-and-observe snapshot per tab, used by `act --observe delta`.
+    act_snapshots: HashMap<String, (u64, String, String)>,
+    /// Last decoded screenshot hash per tab, used to suppress duplicate images.
+    act_screenshot_hashes: HashMap<String, (u64, u64)>,
 }
 
 fn default_idle_shutdown_is_blocked(
@@ -639,6 +644,8 @@ impl DaemonState {
             confirmed_policy_actions: HashSet::new(),
             pin_tab,
             last_persisted_binding: None,
+            act_snapshots: HashMap::new(),
+            act_screenshot_hashes: HashMap::new(),
         }
     }
 
@@ -2694,6 +2701,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "close" => handle_close(state).await,
         "snapshot" => handle_snapshot(cmd, state).await,
         "screenshot" => handle_screenshot(cmd, state).await,
+        "act" => handle_act(cmd, state).await,
         "click" => handle_click(cmd, state).await,
         "dblclick" => handle_dblclick(cmd, state).await,
         "fill" => handle_fill(cmd, state).await,
@@ -2875,6 +2883,16 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     };
 
     let mut resp = match result {
+        Ok(data)
+            if action == "act" && data.get("completed").and_then(Value::as_bool) == Some(false) =>
+        {
+            json!({
+                "id": id,
+                "success": false,
+                "error": "Act stopped after an action failed or required confirmation",
+                "data": data
+            })
+        }
         Ok(data) => success_response(&id, data),
         Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
     };
@@ -5301,6 +5319,205 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
     }
 
     Ok(response)
+}
+
+fn decoded_screenshot_hash(path: &str) -> Result<u64, String> {
+    let encoded = std::fs::read(path)
+        .map_err(|e| format!("Failed to read action observation screenshot: {}", e))?;
+    let image = image::load_from_memory(&encoded)
+        .map_err(|e| format!("Failed to decode action observation screenshot: {}", e))?
+        .to_rgba8();
+    let mut hasher = DefaultHasher::new();
+    image.width().hash(&mut hasher);
+    image.height().hash(&mut hasher);
+    image.as_raw().hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
+/// Executes several normal daemon commands, then captures one coherent final
+/// observation. Nested commands still pass through the canonical dispatcher,
+/// including its policy, validation, and backend checks.
+async fn handle_act(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let actions = cmd
+        .get("actions")
+        .and_then(Value::as_array)
+        .ok_or("Missing 'actions' parameter")?;
+    let inherited_fields = [
+        "plugins",
+        "pinTab",
+        "restoreKey",
+        "restoreSave",
+        "restoreCheckUrl",
+        "restoreCheckText",
+        "restoreCheckFn",
+    ];
+    let mut action_results = Vec::with_capacity(actions.len());
+    let mut completed = true;
+
+    for (index, item) in actions.iter().enumerate() {
+        let command = item.get("command").and_then(Value::as_str).unwrap_or("");
+        let mut request = item
+            .get("request")
+            .cloned()
+            .ok_or_else(|| format!("Missing request for action {}", index + 1))?;
+        request["id"] = json!(format!("act-{}", index + 1));
+        for field in inherited_fields {
+            if let Some(value) = cmd.get(field) {
+                request[field] = value.clone();
+            }
+        }
+
+        // Boxing breaks the recursive future type while retaining the normal
+        // command path for every operation in the atomic request.
+        let response = Box::pin(execute_command(&request, state)).await;
+        let success = response.get("success").and_then(Value::as_bool) == Some(true)
+            && response
+                .pointer("/data/confirmation_required")
+                .and_then(Value::as_bool)
+                != Some(true);
+        let mut result = json!({ "command": command, "success": success });
+        if let Some(data) = response.get("data") {
+            result["result"] = data.clone();
+        }
+        if let Some(error) = response.get("error") {
+            result["error"] = error.clone();
+        }
+        if let Some(code) = response.get("code") {
+            result["code"] = code.clone();
+        }
+        action_results.push(result);
+        if !success {
+            completed = false;
+            break;
+        }
+    }
+
+    let mut output = json!({ "actions": action_results, "completed": completed });
+    if !completed {
+        return Ok(output);
+    }
+
+    if let Some(wait_state) = cmd.get("wait").and_then(Value::as_str) {
+        output["wait"] = handle_waitforloadstate(
+            &json!({ "state": wait_state, "timeout": cmd.get("timeout") }),
+            state,
+        )
+        .await?;
+    }
+
+    output["url"] = handle_url(state).await?["url"].clone();
+
+    if let Some(observe) = cmd.get("observe").and_then(Value::as_str) {
+        let session_id = state
+            .browser
+            .as_ref()
+            .ok_or("Browser not launched")?
+            .active_session_id()?
+            .to_string();
+        let snapshot = handle_snapshot(&json!({}), state).await?;
+        let current = snapshot["snapshot"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let current_url = output["url"].as_str().unwrap_or_default().to_string();
+        if !state.act_snapshots.contains_key(&session_id) && state.act_snapshots.len() >= 32 {
+            if let Some(key) = state.act_snapshots.keys().next().cloned() {
+                state.act_snapshots.remove(&key);
+            }
+        }
+        let previous = state.act_snapshots.get(&session_id).cloned();
+        let revision = previous.as_ref().map_or(1, |(revision, _, _)| revision + 1);
+        let observation = if observe == "delta" {
+            match previous {
+                Some((base_revision, previous_url, baseline))
+                    if previous_url == current_url && baseline == current =>
+                {
+                    json!({
+                        "kind": "unchanged",
+                        "baseRevision": base_revision,
+                        "revision": revision
+                    })
+                }
+                Some((base_revision, previous_url, baseline)) if previous_url == current_url => {
+                    let delta = diff::diff_snapshots(&baseline, &current);
+                    json!({
+                        "kind": "delta",
+                        "baseRevision": base_revision,
+                        "revision": revision,
+                        "diff": delta.diff,
+                        "additions": delta.additions,
+                        "removals": delta.removals
+                    })
+                }
+                _ => json!({
+                    "kind": "full",
+                    "revision": revision,
+                    "tree": current,
+                    "origin": snapshot["origin"],
+                    "refs": snapshot["refs"]
+                }),
+            }
+        } else {
+            json!({
+                "kind": "full",
+                "revision": revision,
+                "tree": current,
+                "origin": snapshot["origin"],
+                "refs": snapshot["refs"]
+            })
+        };
+        state
+            .act_snapshots
+            .insert(session_id, (revision, current_url, current));
+        output["snapshot"] = observation;
+    }
+
+    if cmd
+        .get("screenshotIfChanged")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let session_id = state
+            .browser
+            .as_ref()
+            .ok_or("Browser not launched")?
+            .active_session_id()?
+            .to_string();
+        let screenshot = handle_screenshot(&json!({}), state).await?;
+        let path = screenshot["path"]
+            .as_str()
+            .ok_or("Screenshot did not return a path")?;
+        let hash = decoded_screenshot_hash(path)?;
+        if !state.act_screenshot_hashes.contains_key(&session_id)
+            && state.act_screenshot_hashes.len() >= 32
+        {
+            if let Some(key) = state.act_screenshot_hashes.keys().next().cloned() {
+                state.act_screenshot_hashes.remove(&key);
+            }
+        }
+        let previous = state.act_screenshot_hashes.get(&session_id).copied();
+        let revision = previous.map_or(1, |(revision, _)| revision + 1);
+        let changed = previous.is_none_or(|(_, previous_hash)| previous_hash != hash);
+        if changed {
+            output["screenshot"] = json!({
+                "changed": true,
+                "revision": revision,
+                "path": path
+            });
+        } else {
+            let _ = std::fs::remove_file(path);
+            output["screenshot"] = json!({
+                "changed": false,
+                "revision": revision,
+                "pixelChangeRatio": 0
+            });
+        }
+        state
+            .act_screenshot_hashes
+            .insert(session_id, (revision, hash));
+    }
+
+    Ok(output)
 }
 
 async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {

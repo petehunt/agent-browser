@@ -279,6 +279,21 @@ echo '[
 ]' | agent-browser batch --json
 ```
 
+Use `act` when a workflow needs several actions but only one final observation. Each quoted action runs through the normal parser, policy, and backend checks. The command stops after the first failure and preserves individual results, then returns the final URL plus any requested snapshot or conditional screenshot.
+
+```bash
+agent-browser act \
+  'fill @e1 "pete@example.com"' \
+  'fill @e2 "secret"' \
+  'click @e3' \
+  --wait networkidle \
+  --observe delta \
+  --screenshot-if-changed \
+  --json
+```
+
+`--observe delta` returns a full snapshot on the first observation, a compact unchanged response when the tree matches, and a delta thereafter. Use `--observe full` to force the complete tree. Conditional screenshot history is isolated per tab and hashes decoded RGBA pixels.
+
 ### Clipboard
 
 ```bash

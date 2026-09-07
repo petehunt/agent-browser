@@ -40,6 +40,14 @@ agent-browser batch \
 
 `open` with no URL gives you a clean launch so any interception, cookies, or init scripts you register take effect on the *first* real navigation. Use for SSR-only debug (`--resource-type script`), protected-origin auth, or capturing fresh `react suspense`/`vitals` state without noise from a prior page.
 
+### Action and observation batch
+
+```bash
+agent-browser act 'fill @e1 "pete@example.com"' 'click @e2' --wait networkidle --observe delta --screenshot-if-changed --json
+```
+
+`act` sends one daemon request, executes quoted commands serially, and observes once at the end. Options are `--wait <load|domcontentloaded|networkidle>`, `--observe <full|delta>`, and `--screenshot-if-changed`. The JSON result contains each action's command, success state, and result; `completed`; the final `url`; and requested `snapshot` or `screenshot` objects. It stops after the first failed or confirmation-requiring action. Nested `act` and `batch` commands are rejected.
+
 ## Snapshot (page analysis)
 
 ```bash

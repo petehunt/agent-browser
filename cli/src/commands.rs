@@ -158,6 +158,7 @@ pub fn is_top_level_command(value: &str) -> bool {
             | "device"
             | "diff"
             | "batch"
+            | "act"
             | "react"
             | "vitals"
             | "web-vitals"
@@ -1899,6 +1900,96 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
         }
 
         "diff" => parse_diff(&rest, &id),
+
+        // === Atomic action and observation ===
+        "act" => {
+            let mut action_strings = Vec::new();
+            let mut wait = None;
+            let mut observe = None;
+            let mut screenshot_if_changed = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i] {
+                    "--wait" => {
+                        let value = rest.get(i + 1).ok_or_else(|| ParseError::MissingArguments {
+                            context: "act --wait".to_string(),
+                            usage: "act \"<command>\"... [--wait <state>] [--observe <full|delta>] [--screenshot-if-changed]",
+                        })?;
+                        if !matches!(*value, "load" | "domcontentloaded" | "networkidle") {
+                            return Err(ParseError::InvalidValue {
+                                message: format!("Invalid wait state '{}'; expected load, domcontentloaded, or networkidle", value),
+                                usage: "act \"<command>\"... --wait <load|domcontentloaded|networkidle>",
+                            });
+                        }
+                        wait = Some(*value);
+                        i += 1;
+                    }
+                    "--observe" => {
+                        let value =
+                            rest.get(i + 1)
+                                .ok_or_else(|| ParseError::MissingArguments {
+                                    context: "act --observe".to_string(),
+                                    usage: "act \"<command>\"... --observe <full|delta>",
+                                })?;
+                        if !matches!(*value, "full" | "delta") {
+                            return Err(ParseError::InvalidValue {
+                                message: format!(
+                                    "Invalid observation mode '{}'; expected full or delta",
+                                    value
+                                ),
+                                usage: "act \"<command>\"... --observe <full|delta>",
+                            });
+                        }
+                        observe = Some(*value);
+                        i += 1;
+                    }
+                    "--screenshot-if-changed" => screenshot_if_changed = true,
+                    value if value.starts_with("--") => {
+                        return Err(ParseError::InvalidValue {
+                            message: format!("Unknown act option '{}'", value),
+                            usage: "act \"<command>\"... [--wait <state>] [--observe <full|delta>] [--screenshot-if-changed]",
+                        });
+                    }
+                    value => action_strings.push(value),
+                }
+                i += 1;
+            }
+            if action_strings.is_empty() {
+                return Err(ParseError::MissingArguments {
+                    context: "act".to_string(),
+                    usage: "act \"<command>\"... [--wait <state>] [--observe <full|delta>] [--screenshot-if-changed]",
+                });
+            }
+            let mut actions = Vec::with_capacity(action_strings.len());
+            for action_string in &action_strings {
+                let action_args = shell_words_split(action_string);
+                if action_args.is_empty() {
+                    return Err(ParseError::InvalidValue {
+                        message: "Act commands cannot be empty".to_string(),
+                        usage: "act \"<command>\"...",
+                    });
+                }
+                let parsed = parse_command(&action_args, flags)?;
+                if matches!(
+                    parsed.get("action").and_then(Value::as_str),
+                    Some("act" | "batch")
+                ) {
+                    return Err(ParseError::InvalidValue {
+                        message: "Nested act and batch commands are not supported".to_string(),
+                        usage: "act \"<command>\"...",
+                    });
+                }
+                actions.push(json!({ "command": action_string, "request": parsed }));
+            }
+            Ok(json!({
+                "id": id,
+                "action": "act",
+                "actions": actions,
+                "wait": wait,
+                "observe": observe,
+                "screenshotIfChanged": screenshot_if_changed
+            }))
+        }
 
         // === Batch ===
         "batch" => {
@@ -6297,6 +6388,41 @@ mod tests {
     fn test_batch_no_args_no_commands_field() {
         let cmd = parse_command(&args("batch"), &default_flags()).unwrap();
         assert!(cmd.get("commands").is_none());
+    }
+
+    #[test]
+    fn test_act_parses_actions_and_observation_options() {
+        let cmd_args = vec![
+            "act".to_string(),
+            "fill @e1 \"pete@example.com\"".to_string(),
+            "click @e2".to_string(),
+            "--wait".to_string(),
+            "networkidle".to_string(),
+            "--observe".to_string(),
+            "delta".to_string(),
+            "--screenshot-if-changed".to_string(),
+        ];
+        let cmd = parse_command(&cmd_args, &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "act");
+        assert_eq!(cmd["wait"], "networkidle");
+        assert_eq!(cmd["observe"], "delta");
+        assert_eq!(cmd["screenshotIfChanged"], true);
+        assert_eq!(cmd["actions"][0]["request"]["action"], "fill");
+        assert_eq!(cmd["actions"][0]["request"]["value"], "pete@example.com");
+        assert_eq!(cmd["actions"][1]["request"]["action"], "click");
+    }
+
+    #[test]
+    fn test_act_requires_an_action() {
+        let result = parse_command(&args("act --observe full"), &default_flags());
+        assert!(matches!(result, Err(ParseError::MissingArguments { .. })));
+    }
+
+    #[test]
+    fn test_act_rejects_nested_batches() {
+        let cmd_args = vec!["act".to_string(), "batch \"get url\"".to_string()];
+        let result = parse_command(&cmd_args, &default_flags());
+        assert!(matches!(result, Err(ParseError::InvalidValue { .. })));
     }
 
     #[test]

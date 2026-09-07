@@ -16,6 +16,9 @@ use super::element::{resolve_element_center, resolve_element_object_id, RefMap};
 pub struct ClickResult {
     pub dialog_opened: bool,
     pub pending_release: Option<PendingRelease>,
+    pub x: f64,
+    pub y: f64,
+    pub button_pressed: bool,
 }
 
 pub struct PendingRelease {
@@ -1019,6 +1022,9 @@ async fn dispatch_click(
         return Ok(ClickResult {
             dialog_opened: true,
             pending_release: None,
+            x,
+            y,
+            button_pressed: false,
         });
     }
 
@@ -1058,6 +1064,9 @@ async fn dispatch_click(
                 y,
                 button: button.to_string(),
             }),
+            x,
+            y,
+            button_pressed: true,
         });
     }
 
@@ -1083,6 +1092,9 @@ async fn dispatch_click(
     Ok(ClickResult {
         dialog_opened,
         pending_release: None,
+        x,
+        y,
+        button_pressed: true,
     })
 }
 

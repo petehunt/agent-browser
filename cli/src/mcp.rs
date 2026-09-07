@@ -1378,6 +1378,8 @@ fn parity_tools() -> Vec<Value> {
                     "maximum": crate::native::recording::MAX_FPS,
                     "description": "Capture rate in frames per second (default 30, max 60).",
                 },
+                "contactSheet": { "type": "boolean", "description": "Export changed frames as a timestamped PNG contact sheet beside the video." },
+                "contactSheetThreshold": { "type": "number", "minimum": 0, "maximum": 1, "description": "Changed-pixel ratio required to select a contact-sheet frame (default 0.05). Implies contactSheet." },
             }),
             &["path"],
         ),
@@ -1401,6 +1403,8 @@ fn parity_tools() -> Vec<Value> {
                     "maximum": crate::native::recording::MAX_FPS,
                     "description": "Capture rate in frames per second (default 30, max 60).",
                 },
+                "contactSheet": { "type": "boolean", "description": "Export changed frames as a timestamped PNG contact sheet beside the video." },
+                "contactSheetThreshold": { "type": "number", "minimum": 0, "maximum": 1, "description": "Changed-pixel ratio required to select a contact-sheet frame (default 0.05). Implies contactSheet." },
             }),
             &["path"],
         ),
@@ -3080,6 +3084,13 @@ fn record_command_args(arguments: &Value, action: &str) -> Result<Vec<String>, P
         args.push("--fps".to_string());
         args.push(fps.to_string());
     }
+    if optional_bool(arguments, "contactSheet")?.unwrap_or(false) {
+        args.push("--contact-sheet".to_string());
+    }
+    if let Some(threshold) = optional_number_string(arguments, "contactSheetThreshold")? {
+        args.push("--contact-sheet-threshold".to_string());
+        args.push(threshold);
+    }
     Ok(args)
 }
 
@@ -4546,7 +4557,7 @@ mod tests {
     }
 
     #[test]
-    fn record_schema_and_args_include_fps() {
+    fn record_schema_and_args_match_cli_options() {
         for name in [TOOL_RECORD_START, TOOL_RECORD_RESTART] {
             let tool = tools()
                 .into_iter()
@@ -4557,6 +4568,13 @@ mod tests {
             assert_eq!(fps["minimum"], json!(1));
             // Must stay in sync with the CLI parser's --fps ceiling.
             assert_eq!(fps["maximum"], json!(crate::native::recording::MAX_FPS));
+            assert_eq!(
+                tool["inputSchema"]["properties"]["contactSheet"]["type"],
+                "boolean"
+            );
+            let threshold = &tool["inputSchema"]["properties"]["contactSheetThreshold"];
+            assert_eq!(threshold["minimum"], json!(0));
+            assert_eq!(threshold["maximum"], json!(1));
         }
 
         assert_eq!(
@@ -4582,6 +4600,25 @@ mod tests {
         assert_eq!(
             record_command_args(&json!({ "path": "demo.webm" }), "start").unwrap(),
             vec!["record", "start", "demo.webm"]
+        );
+        assert_eq!(
+            record_command_args(
+                &json!({
+                    "path": "demo.webm",
+                    "contactSheet": true,
+                    "contactSheetThreshold": 0.08
+                }),
+                "start"
+            )
+            .unwrap(),
+            vec![
+                "record",
+                "start",
+                "demo.webm",
+                "--contact-sheet",
+                "--contact-sheet-threshold",
+                "0.08"
+            ]
         );
     }
 

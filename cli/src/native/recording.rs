@@ -159,7 +159,7 @@ fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Command 
     let mut cmd = tokio::process::Command::new("ffmpeg");
     let high_fps = fps > HIGH_FPS_THRESHOLD;
 
-    cmd.args(["-y"])
+    cmd.args(["-y", "-loglevel", "error"])
         .args(["-avioflags", "direct"])
         .args([
             "-fpsprobesize",

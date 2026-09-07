@@ -1098,7 +1098,7 @@ fn has_os_error(error: &str, code: u32) -> bool {
 fn read_timeout_for(cmd: &Value) -> Duration {
     if matches!(
         cmd.get("action").and_then(Value::as_str),
-        Some("recording_stop" | "recording_restart")
+        Some("recording_stop" | "recording_restart" | "video_stop" | "close")
     ) {
         return Duration::from_secs(30 * 60);
     }

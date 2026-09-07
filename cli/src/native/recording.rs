@@ -100,13 +100,16 @@ pub struct RecordingCursorState {
 
 #[derive(Clone, Debug, Default)]
 pub struct RecordingCursorHistory {
+    enabled: bool,
     samples: VecDeque<(f64, RecordingCursorState)>,
 }
 
 impl RecordingCursorHistory {
     /// Record input after Chrome acknowledges it.
     pub fn record(&mut self, x: f64, y: f64, buttons: i32) {
-        self.record_at(cursor_timestamp(), x, y, buttons);
+        if self.enabled {
+            self.record_at(cursor_timestamp(), x, y, buttons);
+        }
     }
 
     pub fn record_at(&mut self, timestamp: f64, x: f64, y: f64, buttons: i32) {
@@ -465,7 +468,10 @@ pub fn recording_start(
     state.contact_sheet_frame_count = 0;
     state.cursor = options.cursor;
     if let Ok(mut cursor) = state.shared_cursor.lock() {
-        *cursor = RecordingCursorHistory::default();
+        *cursor = RecordingCursorHistory {
+            enabled: options.cursor,
+            ..Default::default()
+        };
     }
     state.contact_sheet = options.contact_sheet;
     state.contact_sheet_threshold = threshold;
@@ -514,7 +520,7 @@ fn build_ffmpeg_command(output_path: &str, fps: u32, cursor: bool) -> tokio::pro
     let mut cmd = tokio::process::Command::new("ffmpeg");
     let high_fps = fps > HIGH_FPS_THRESHOLD;
 
-    cmd.args(["-y"])
+    cmd.args(["-y", "-loglevel", "error"])
         .args(["-avioflags", "direct"])
         .args([
             "-fpsprobesize",
@@ -1369,6 +1375,10 @@ pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), Strin
         let _ = tx.send(());
     }
 
+    if let Ok(mut cursor) = state.shared_cursor.lock() {
+        cursor.enabled = false;
+    }
+
     let counter = state.shared_frame_count.take();
     let captured = state.shared_captured_count.take();
     let contact_sheet = state.shared_contact_sheet_count.take();
@@ -1397,11 +1407,32 @@ pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), Strin
         *guard = None;
     }
 
+    if let Ok(mut cursor) = state.shared_cursor.lock() {
+        *cursor = RecordingCursorHistory::default();
+    }
     result
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_history_only_collects_during_cursor_recordings() {
+        let mut state = RecordingState::new();
+        state.shared_cursor.lock().unwrap().record(1.0, 2.0, 0);
+        assert!(state.shared_cursor.lock().unwrap().samples.is_empty());
+        recording_start(
+            &mut state,
+            "unused.webm",
+            RecordingOptions {
+                cursor: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        state.shared_cursor.lock().unwrap().record(3.0, 4.0, 0);
+        assert_eq!(state.shared_cursor.lock().unwrap().samples.len(), 1);
+    }
 
     #[test]
     fn test_cursor_history_matches_capture_not_arrival() {

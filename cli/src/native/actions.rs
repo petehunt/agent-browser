@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -221,6 +222,16 @@ struct SnapshotRevision {
     refs: serde_json::Map<String, Value>,
 }
 
+#[derive(Debug, Clone)]
+struct ScreenshotObservation {
+    revision: u64,
+    signature: String,
+    decoded_hash: u64,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
 #[derive(Default)]
 struct DrainedEvents {
     pending_acks: Vec<i64>,
@@ -432,6 +443,7 @@ pub struct DaemonState {
     pub ref_map: RefMap,
     /// Last delta snapshot per page session. Bounded to the currently tracked tabs.
     snapshot_revisions: HashMap<String, SnapshotRevision>,
+    screenshot_observations: HashMap<String, ScreenshotObservation>,
     pub domain_filter: Arc<RwLock<Option<DomainFilter>>>,
     pub event_tracker: EventTracker,
     pub session_name: Option<String>,
@@ -575,6 +587,7 @@ impl DaemonState {
             backend_type: BackendType::Cdp,
             ref_map: RefMap::new(),
             snapshot_revisions: HashMap::new(),
+            screenshot_observations: HashMap::new(),
             domain_filter: Arc::new(RwLock::new(
                 env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
                     .ok()
@@ -5365,11 +5378,111 @@ async fn snapshot_document_scope(client: &CdpClient, session_id: &str) -> String
     format!("{}:{}", session_id, loader_id)
 }
 
+fn decode_screenshot_pixels(base64_data: &str) -> Result<(u32, u32, Vec<u8>, u64), String> {
+    let encoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_data)
+        .map_err(|e| format!("Base64 decode error: {}", e))?;
+    let image = image::load_from_memory(&encoded)
+        .map_err(|e| format!("Failed to decode screenshot pixels: {}", e))?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    let rgba = image.into_raw();
+    let mut hasher = DefaultHasher::new();
+    width.hash(&mut hasher);
+    height.hash(&mut hasher);
+    rgba.hash(&mut hasher);
+    Ok((width, height, rgba, hasher.finish()))
+}
+
+fn changed_pixel_ratio(
+    previous: &ScreenshotObservation,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> f64 {
+    if previous.width != width || previous.height != height || previous.rgba.len() != rgba.len() {
+        return 1.0;
+    }
+    if rgba.is_empty() {
+        return 0.0;
+    }
+    let changed = previous
+        .rgba
+        .chunks_exact(4)
+        .zip(rgba.chunks_exact(4))
+        .filter(|(before, after)| before != after)
+        .count();
+    changed as f64 / (rgba.len() / 4) as f64
+}
+
+/// Compares decoded pixels with the preceding capture for the same tab and scope.
+/// Encoded image metadata therefore cannot create a false positive.
+fn observe_screenshot(
+    state: &mut DaemonState,
+    key: String,
+    signature: String,
+    base64_data: &str,
+    threshold: f64,
+) -> Result<Value, String> {
+    let (width, height, rgba, decoded_hash) = decode_screenshot_pixels(base64_data)?;
+    // Evict stale tab history before admitting another capture scope so decoded
+    // image buffers remain bounded even during long multi-tab sessions.
+    if !state.screenshot_observations.contains_key(&key)
+        && state.screenshot_observations.len() >= 32
+    {
+        if let Some(eviction_key) = state.screenshot_observations.keys().next().cloned() {
+            state.screenshot_observations.remove(&eviction_key);
+        }
+    }
+    let previous = state.screenshot_observations.get(&key);
+    let revision = previous.map_or(1, |item| item.revision.saturating_add(1));
+    let pixel_change_ratio = match previous {
+        Some(item) if item.signature == signature && item.decoded_hash == decoded_hash => 0.0,
+        Some(item) if item.signature == signature => {
+            changed_pixel_ratio(item, width, height, &rgba)
+        }
+        _ => 1.0,
+    };
+    let changed = previous.is_none()
+        || previous.is_some_and(|item| item.signature != signature)
+        || pixel_change_ratio > threshold;
+
+    state.screenshot_observations.insert(
+        key,
+        ScreenshotObservation {
+            revision,
+            signature,
+            decoded_hash,
+            width,
+            height,
+            rgba,
+        },
+    );
+    Ok(json!({
+        "changed": changed,
+        "revision": revision,
+        "pixelChangeRatio": pixel_change_ratio,
+        "threshold": threshold
+    }))
+}
+
 async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let annotate = cmd
         .get("annotate")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let if_changed = cmd
+        .get("ifChanged")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let threshold = cmd.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let signature = format!(
+        "selector={:?};fullPage={};annotate={}",
+        cmd.get("selector").and_then(|v| v.as_str()),
+        cmd.get("fullPage")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        annotate
+    );
 
     if let Some(ref wb) = state.webdriver_backend {
         if state.browser.is_none() {
@@ -5381,30 +5494,37 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
             }
 
             let base64_data = wb.screenshot().await?;
-            let path = cmd.get("path").and_then(|v| v.as_str());
-            if let Some(p) = path {
-                let bytes = base64::Engine::decode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &base64_data,
+            let explicit_path = cmd.get("path").and_then(|v| v.as_str());
+            let path = explicit_path.map(String::from).unwrap_or_else(|| {
+                format!(
+                    "/tmp/screenshot-{}.png",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0)
                 )
-                .map_err(|e| format!("Base64 decode error: {}", e))?;
-                std::fs::write(p, bytes)
-                    .map_err(|e| format!("Failed to write screenshot: {}", e))?;
-                return Ok(json!({ "path": p }));
-            }
-            let tmp = format!(
-                "/tmp/screenshot-{}.png",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0)
-            );
+            });
             let bytes =
                 base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &base64_data)
                     .map_err(|e| format!("Base64 decode error: {}", e))?;
-            std::fs::write(&tmp, bytes)
+            std::fs::write(&path, bytes)
                 .map_err(|e| format!("Failed to write screenshot: {}", e))?;
-            return Ok(json!({ "path": tmp }));
+            if if_changed {
+                let mut response = observe_screenshot(
+                    state,
+                    "webdriver-active".to_string(),
+                    signature,
+                    &base64_data,
+                    threshold,
+                )?;
+                if response["changed"].as_bool() == Some(true) {
+                    response["path"] = json!(path);
+                } else if explicit_path.is_none() {
+                    let _ = std::fs::remove_file(&path);
+                }
+                return Ok(response);
+            }
+            return Ok(json!({ "path": path }));
         }
     }
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
@@ -5466,7 +5586,18 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
     )
     .await?;
 
-    let mut response = json!({ "path": result.path });
+    let mut response = if if_changed {
+        let mut observation =
+            observe_screenshot(state, session_id, signature, &result.base64, threshold)?;
+        if observation["changed"].as_bool() == Some(true) {
+            observation["path"] = json!(result.path);
+        } else if options.path.is_none() {
+            let _ = std::fs::remove_file(&result.path);
+        }
+        observation
+    } else {
+        json!({ "path": result.path })
+    };
     if !result.annotations.is_empty() {
         response["annotations"] = serde_json::to_value(&result.annotations)
             .map_err(|e| format!("Failed to serialize annotations: {}", e))?;
@@ -12351,6 +12482,33 @@ mod tests {
     use std::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn screenshot_pixel_ratio_counts_changed_pixels() {
+        let previous = ScreenshotObservation {
+            revision: 1,
+            signature: "viewport".to_string(),
+            decoded_hash: 0,
+            width: 2,
+            height: 1,
+            rgba: vec![0, 0, 0, 255, 255, 255, 255, 255],
+        };
+        let current = vec![0, 0, 0, 255, 255, 0, 255, 255];
+        assert_eq!(changed_pixel_ratio(&previous, 2, 1, &current), 0.5);
+    }
+
+    #[test]
+    fn screenshot_pixel_ratio_treats_dimension_change_as_full_change() {
+        let previous = ScreenshotObservation {
+            revision: 1,
+            signature: "viewport".to_string(),
+            decoded_hash: 0,
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 0, 255],
+        };
+        assert_eq!(changed_pixel_ratio(&previous, 2, 1, &[0; 8]), 1.0);
+    }
 
     /// A binding-recovery failure must tear the connection down: the attach
     /// paths set `state.browser` before calling this, so returning the error

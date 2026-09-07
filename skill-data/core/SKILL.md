@@ -286,7 +286,11 @@ agent-browser screenshot                        # temp path, printed on stdout
 agent-browser screenshot page.png               # specific path
 agent-browser screenshot --full full.png        # full scroll height
 agent-browser screenshot --annotate map.png     # numbered labels + legend keyed to snapshot refs
+agent-browser screenshot --if-changed           # return a path only when pixels changed
+agent-browser screenshot --threshold 0.01       # ignore changes affecting at most 1% of pixels
 ```
+
+Conditional screenshots are tracked per tab and capture scope. The first capture is changed. Later captures return `changed`, `revision`, and `pixelChangeRatio`; unchanged captures omit the path so agents and MCP clients do not resend identical image content. Comparison uses decoded RGBA pixels, so image encoding metadata does not count as a page change.
 
 Headless Chromium screenshots hide native scrollbars for consistent image output. Pass `--hide-scrollbars false` when launching to keep native scrollbars visible.
 

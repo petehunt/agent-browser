@@ -145,8 +145,6 @@ agent-browser drag @e1 @e2                # drag and drop
 agent-browser drag @e1 @e2 --human        # drag with curved, eased movement
 ```
 
-Pointer interpolation starts at the last dispatched cursor position, including element clicks, hovers, and checkbox interactions.
-
 ### When refs don't work or you don't want to snapshot
 
 Use semantic locators:

@@ -299,7 +299,7 @@ agent-browser mouse up [button]       # Release button
 agent-browser mouse wheel <dy> [dx]   # Scroll wheel
 ```
 
-Add `--human` to `click` or `drag` to approach targets along a seeded eased curve. The daemon remembers the cursor position for the session, emits intermediate `mousemove` events, and always finishes at the exact target coordinate. Pointer interpolation starts at the last dispatched cursor position, including element clicks, hovers, and checkbox interactions.
+Add `--human` to `click` or `drag` for curved, eased movement from the current cursor position.
 
 ### Browser Settings
 

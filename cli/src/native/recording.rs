@@ -727,8 +727,10 @@ fn changed_pixel_ratio(before: &image::RgbImage, after: &image::RgbImage) -> f64
     }
     let changed = before
         .as_raw()
-        .chunks_exact(3)
-        .zip(after.as_raw().chunks_exact(3))
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(after.as_raw().as_chunks::<3>().0)
         .filter(|(a, b)| a != b)
         .count();
     changed as f64 / (width as u64 * height as u64) as f64
@@ -749,8 +751,10 @@ fn changed_pixel_regions(before: &image::RgbImage, after: &image::RgbImage) -> V
     let mut tile_counts = vec![0u32; (tiles_wide * tiles_high) as usize];
     for (index, (a, b)) in before
         .as_raw()
-        .chunks_exact(3)
-        .zip(after.as_raw().chunks_exact(3))
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(after.as_raw().as_chunks::<3>().0)
         .enumerate()
     {
         if a != b {

@@ -29,11 +29,16 @@ pub const DEFAULT_CONTACT_SHEET_THRESHOLD: f64 = 0.05;
 pub const MAX_CONTACT_SHEET_FRAMES: usize = 100;
 
 const CONTACT_SHEET_COLUMNS: u32 = 4;
-const CONTACT_SHEET_CELL_WIDTH: u32 = 320;
+const CONTACT_SHEET_CELL_WIDTH: u32 = 640;
 const CONTACT_SHEET_LABEL_HEIGHT: u32 = 24;
 const CONTACT_SHEET_GAP: u32 = 8;
-const CONTACT_SHEET_DIFF_WIDTH: u32 = 160;
+const CONTACT_SHEET_DIFF_WIDTH: u32 = 320;
 const CONTACT_SHEET_PIXEL_DELTA: u8 = 24;
+const CONTACT_SHEET_TILE_SIZE: u32 = 8;
+const CONTACT_SHEET_MIN_TILE_PIXELS: u32 = 4;
+const CONTACT_SHEET_MIN_REGION_PIXELS: u64 = 8;
+const CONTACT_SHEET_REGION_PADDING_TILES: u32 = 1;
+const CONTACT_SHEET_REGION_MERGE_GAP_TILES: u32 = 4;
 
 /// Rate above which the deferred encoder uses a second thread.
 const HIGH_FPS_THRESHOLD: u32 = 30;
@@ -287,14 +292,13 @@ fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Command 
 struct ContactSheetFrame {
     jpeg: Vec<u8>,
     elapsed_ms: u64,
-    /// Changed-region bounds normalized to the source frame.
-    changed_region: [f32; 4],
 }
 
 struct ContactSheetCollector {
     threshold: f64,
     selected: Vec<ContactSheetFrame>,
     previous_selected: Option<image::RgbImage>,
+    latest: Option<ContactSheetFrame>,
 }
 
 impl ContactSheetCollector {
@@ -303,10 +307,16 @@ impl ContactSheetCollector {
             threshold,
             selected: Vec::new(),
             previous_selected: None,
+            latest: None,
         }
     }
 
     fn consider(&mut self, jpeg: &[u8], elapsed: Duration) {
+        let elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        self.latest = Some(ContactSheetFrame {
+            jpeg: jpeg.to_vec(),
+            elapsed_ms,
+        });
         if self.selected.len() >= MAX_CONTACT_SHEET_FRAMES {
             return;
         }
@@ -328,38 +338,55 @@ impl ContactSheetCollector {
             .to_rgb8();
 
         let selection = match self.previous_selected.as_ref() {
-            None => Some([0.0, 0.0, 1.0, 1.0]),
+            None => Some(()),
             Some(previous) => {
-                let (ratio, region) = changed_pixel_region(previous, &thumbnail);
-                (ratio > 0.0 && ratio >= self.threshold).then_some(region)
+                let (ratio, _) = changed_pixel_regions(previous, &thumbnail);
+                (ratio > 0.0 && ratio >= self.threshold).then_some(())
             }
         };
-        if let Some(changed_region) = selection {
+        if selection.is_some() {
             self.previous_selected = Some(thumbnail);
             self.selected.push(ContactSheetFrame {
                 jpeg: jpeg.to_vec(),
-                elapsed_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
-                changed_region,
+                elapsed_ms,
             });
         }
     }
+
+    fn finish(mut self) -> Vec<ContactSheetFrame> {
+        if let Some(latest) = self.latest {
+            let already_selected = self
+                .selected
+                .last()
+                .is_some_and(|frame| frame.elapsed_ms == latest.elapsed_ms);
+            if !already_selected {
+                if self.selected.len() >= MAX_CONTACT_SHEET_FRAMES {
+                    self.selected.pop();
+                }
+                self.selected.push(latest);
+            }
+        }
+        self.selected
+    }
 }
 
-/// Ratio and normalized bounding rectangle of pixels that changed enough to
-/// matter visually. Comparing thumbnails bounds work at high capture rates.
-fn changed_pixel_region(before: &image::RgbImage, after: &image::RgbImage) -> (f64, [f32; 4]) {
+/// Ratio and normalized bounds of visually changed tile clusters. Tile density
+/// suppresses isolated noise while preserving separate areas of page activity.
+fn changed_pixel_regions(
+    before: &image::RgbImage,
+    after: &image::RgbImage,
+) -> (f64, Vec<[f32; 4]>) {
     if before.dimensions() != after.dimensions() {
-        return (1.0, [0.0, 0.0, 1.0, 1.0]);
+        return (1.0, vec![[0.0, 0.0, 1.0, 1.0]]);
     }
     let (width, height) = after.dimensions();
     if width == 0 || height == 0 {
-        return (0.0, [0.0, 0.0, 0.0, 0.0]);
+        return (0.0, Vec::new());
     }
     let mut changed = 0u64;
-    let mut min_x = width;
-    let mut min_y = height;
-    let mut max_x = 0;
-    let mut max_y = 0;
+    let tiles_wide = width.div_ceil(CONTACT_SHEET_TILE_SIZE);
+    let tiles_high = height.div_ceil(CONTACT_SHEET_TILE_SIZE);
+    let mut tile_counts = vec![0u32; (tiles_wide * tiles_high) as usize];
     for y in 0..height {
         for x in 0..width {
             let a = before.get_pixel(x, y).0;
@@ -372,24 +399,100 @@ fn changed_pixel_region(before: &image::RgbImage, after: &image::RgbImage) -> (f
                 .unwrap_or(0);
             if delta >= CONTACT_SHEET_PIXEL_DELTA {
                 changed += 1;
-                min_x = min_x.min(x);
-                min_y = min_y.min(y);
-                max_x = max_x.max(x);
-                max_y = max_y.max(y);
+                let tile_x = x / CONTACT_SHEET_TILE_SIZE;
+                let tile_y = y / CONTACT_SHEET_TILE_SIZE;
+                tile_counts[(tile_y * tiles_wide + tile_x) as usize] += 1;
             }
         }
     }
     if changed == 0 {
-        return (0.0, [0.0, 0.0, 0.0, 0.0]);
+        return (0.0, Vec::new());
     }
     let ratio = changed as f64 / (width as u64 * height as u64) as f64;
-    let region = [
-        min_x as f32 / width as f32,
-        min_y as f32 / height as f32,
-        (max_x - min_x + 1) as f32 / width as f32,
-        (max_y - min_y + 1) as f32 / height as f32,
-    ];
-    (ratio, region)
+    let mut components: Vec<(u64, u32, u32, u32, u32)> = Vec::new();
+    for start_y in 0..tiles_high {
+        for start_x in 0..tiles_wide {
+            let start = (start_y * tiles_wide + start_x) as usize;
+            if tile_counts[start] < CONTACT_SHEET_MIN_TILE_PIXELS {
+                continue;
+            }
+            let initial_pixels = tile_counts[start] as u64;
+            tile_counts[start] = 0;
+            let mut pending = std::collections::VecDeque::from([(start_x, start_y)]);
+            let (mut min_x, mut min_y, mut max_x, mut max_y) = (start_x, start_y, start_x, start_y);
+            let mut pixels = initial_pixels;
+            while let Some((x, y)) = pending.pop_front() {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                for neighbor_y in y.saturating_sub(1)..=(y + 1).min(tiles_high - 1) {
+                    for neighbor_x in x.saturating_sub(1)..=(x + 1).min(tiles_wide - 1) {
+                        let neighbor = (neighbor_y * tiles_wide + neighbor_x) as usize;
+                        if tile_counts[neighbor] >= CONTACT_SHEET_MIN_TILE_PIXELS {
+                            pixels += tile_counts[neighbor] as u64;
+                            tile_counts[neighbor] = 0;
+                            pending.push_back((neighbor_x, neighbor_y));
+                        }
+                    }
+                }
+            }
+            if pixels >= CONTACT_SHEET_MIN_REGION_PIXELS {
+                components.push((pixels, min_x, min_y, max_x, max_y));
+            }
+        }
+    }
+    let gap = CONTACT_SHEET_REGION_MERGE_GAP_TILES;
+    // Revisit all pairs after a union: the enlarged region may now reach a
+    // component inspected earlier. Never discard regions to meet a box limit.
+    let mut index = 0;
+    while index < components.len() {
+        let mut other = index + 1;
+        while other < components.len() {
+            let (_, ax1, ay1, ax2, ay2) = components[index];
+            let (_, bx1, by1, bx2, by2) = components[other];
+            let close = ax1 <= bx2.saturating_add(gap)
+                && bx1 <= ax2.saturating_add(gap)
+                && ay1 <= by2.saturating_add(gap)
+                && by1 <= ay2.saturating_add(gap);
+            if close {
+                let merged = components.swap_remove(other);
+                components[index].0 += merged.0;
+                components[index].1 = components[index].1.min(merged.1);
+                components[index].2 = components[index].2.min(merged.2);
+                components[index].3 = components[index].3.max(merged.3);
+                components[index].4 = components[index].4.max(merged.4);
+                index = 0;
+                other = 1;
+            } else {
+                other += 1;
+            }
+        }
+        index += 1;
+    }
+    components.sort_by_key(|&(_, min_x, min_y, _, _)| (min_y, min_x));
+    let regions = components
+        .into_iter()
+        .map(|(_, min_tile_x, min_tile_y, max_tile_x, max_tile_y)| {
+            let min_x = min_tile_x.saturating_sub(CONTACT_SHEET_REGION_PADDING_TILES)
+                * CONTACT_SHEET_TILE_SIZE;
+            let min_y = min_tile_y.saturating_sub(CONTACT_SHEET_REGION_PADDING_TILES)
+                * CONTACT_SHEET_TILE_SIZE;
+            let max_x = ((max_tile_x + CONTACT_SHEET_REGION_PADDING_TILES + 1)
+                * CONTACT_SHEET_TILE_SIZE)
+                .min(width);
+            let max_y = ((max_tile_y + CONTACT_SHEET_REGION_PADDING_TILES + 1)
+                * CONTACT_SHEET_TILE_SIZE)
+                .min(height);
+            [
+                min_x as f32 / width as f32,
+                min_y as f32 / height as f32,
+                (max_x - min_x) as f32 / width as f32,
+                (max_y - min_y) as f32 / height as f32,
+            ]
+        })
+        .collect();
+    (ratio, regions)
 }
 
 fn format_contact_timestamp(milliseconds: u64) -> String {
@@ -466,7 +569,16 @@ fn draw_changed_region(image: &mut image::RgbaImage, x: u32, y: u32, width: u32,
     }
     let right = (x + width - 1).min(image.width().saturating_sub(1));
     let bottom = (y + height - 1).min(image.height().saturating_sub(1));
-    for thickness in 0..3 {
+    // A light tint keeps the content legible; the solid edge defines its bounds.
+    for py in y..=bottom {
+        for px in x..=right {
+            let pixel = image.get_pixel_mut(px, py);
+            for (channel, tint) in pixel.0[..3].iter_mut().zip([239u16, 68, 68]) {
+                *channel = ((*channel as u16 * 7 + tint) / 8) as u8;
+            }
+        }
+    }
+    for thickness in 0..2 {
         let left = x.saturating_sub(thickness);
         let top = y.saturating_sub(thickness);
         let r = (right + thickness).min(image.width().saturating_sub(1));
@@ -500,9 +612,15 @@ fn write_contact_sheet(path: &Path, frames: &[ContactSheetFrame]) -> Result<(), 
     let mut canvas =
         image::RgbaImage::from_pixel(canvas_width, canvas_height, image::Rgba([17, 24, 39, 255]));
 
+    let mut previous_source: Option<image::RgbImage> = None;
     for (index, frame) in frames.iter().enumerate() {
         let source = image::load_from_memory(&frame.jpeg)
             .map_err(|e| format!("Failed to decode contact sheet frame: {}", e))?;
+        let source_rgb = source.to_rgb8();
+        let changed_regions = previous_source
+            .as_ref()
+            .map(|previous| changed_pixel_regions(previous, &source_rgb).1)
+            .unwrap_or_default();
         let rendered = source
             .resize(
                 CONTACT_SHEET_CELL_WIDTH,
@@ -525,14 +643,16 @@ fn write_contact_sheet(path: &Path, frames: &[ContactSheetFrame]) -> Result<(), 
             &format_contact_timestamp(frame.elapsed_ms),
         );
 
-        let [rx, ry, rw, rh] = frame.changed_region;
-        draw_changed_region(
-            &mut canvas,
-            image_x + (rx * rendered.width() as f32).round() as u32,
-            image_y + (ry * rendered.height() as f32).round() as u32,
-            (rw * rendered.width() as f32).round().max(1.0) as u32,
-            (rh * rendered.height() as f32).round().max(1.0) as u32,
-        );
+        for [rx, ry, rw, rh] in &changed_regions {
+            draw_changed_region(
+                &mut canvas,
+                image_x + (rx * rendered.width() as f32).round() as u32,
+                image_y + (ry * rendered.height() as f32).round() as u32,
+                (rw * rendered.width() as f32).round().max(1.0) as u32,
+                (rh * rendered.height() as f32).round().max(1.0) as u32,
+            );
+        }
+        previous_source = Some(source_rgb);
     }
 
     if let Some(parent) = path
@@ -685,8 +805,7 @@ pub fn spawn_recording_task(
         shared_count.store(written, Ordering::Relaxed);
 
         if let Some(path) = contact_sheet_path {
-            let contact_frames =
-                select_contact_frames(&capture.frames, contact_sheet_threshold)?;
+            let contact_frames = select_contact_frames(&capture.frames, contact_sheet_threshold)?;
             write_contact_sheet(Path::new(&path), &contact_frames)?;
             shared_contact_sheet_count.store(contact_frames.len() as u64, Ordering::Relaxed);
         }
@@ -767,7 +886,7 @@ fn select_contact_frames(
             .map_err(|e| format!("Failed to read contact sheet frame: {}", e))?;
         collector.consider(&clean, frame.elapsed);
     }
-    Ok(collector.selected)
+    Ok(collector.finish())
 }
 
 async fn encode_capture(
@@ -942,17 +1061,73 @@ mod tests {
     }
 
     #[test]
-    fn test_changed_pixel_region_reports_ratio_and_bounds() {
-        let before = image::RgbImage::from_pixel(10, 10, image::Rgb([0, 0, 0]));
+    fn test_changed_pixel_regions_reports_separate_bounds() {
+        let before = image::RgbImage::from_pixel(64, 64, image::Rgb([0, 0, 0]));
         let mut after = before.clone();
-        for y in 3..7 {
-            for x in 2..5 {
+        for y in 8..16 {
+            for x in 8..16 {
                 after.put_pixel(x, y, image::Rgb([255, 255, 255]));
             }
         }
-        let (ratio, bounds) = changed_pixel_region(&before, &after);
-        assert!((ratio - 0.12).abs() < f64::EPSILON);
-        assert_eq!(bounds, [0.2, 0.3, 0.3, 0.4]);
+        for y in 40..48 {
+            for x in 48..56 {
+                after.put_pixel(x, y, image::Rgb([255, 255, 255]));
+            }
+        }
+        let (ratio, regions) = changed_pixel_regions(&before, &after);
+        assert!((ratio - 0.03125).abs() < f64::EPSILON);
+        assert_eq!(
+            regions,
+            vec![[0.0, 0.0, 0.375, 0.375], [0.625, 0.5, 0.375, 0.375]]
+        );
+    }
+
+    #[test]
+    fn test_contact_sheet_covers_every_flyout_control_and_distant_region() {
+        let before = image::RgbImage::from_pixel(1024, 512, image::Rgb([255, 255, 255]));
+        let mut after = before.clone();
+        let mut changed_points = Vec::new();
+        // Rows in a newly opened flyout, plus more than eight remote changes.
+        for (x, y) in (0..6)
+            .map(|row| (16, 16 + row * 32))
+            .chain((0..12).map(|i| (256 + (i % 6) * 112, 32 + (i / 6) * 200)))
+        {
+            for py in y..y + 8 {
+                for px in x..x + 16 {
+                    after.put_pixel(px, py, image::Rgb([0, 0, 0]));
+                    changed_points.push((px, py));
+                }
+            }
+        }
+        let (_, regions) = changed_pixel_regions(&before, &after);
+        assert_eq!(regions.len(), 13, "flyout rows should form one region");
+        for (x, y) in changed_points {
+            assert!(
+                regions.iter().any(|[rx, ry, rw, rh]| {
+                    let x = x as f32 / 1024.0;
+                    let y = y as f32 / 512.0;
+                    x >= *rx && x < rx + rw && y >= *ry && y < ry + rh
+                }),
+                "uncovered change at {x},{y}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_contact_sheet_finish_includes_latest_frame() {
+        let mut collector = ContactSheetCollector::new(0.05);
+        collector.selected.push(ContactSheetFrame {
+            jpeg: vec![1],
+            elapsed_ms: 10,
+        });
+        collector.latest = Some(ContactSheetFrame {
+            jpeg: vec![2],
+            elapsed_ms: 20,
+        });
+
+        let frames = collector.finish();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.last().unwrap().jpeg, vec![2]);
     }
 
     #[test]

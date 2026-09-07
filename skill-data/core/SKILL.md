@@ -88,7 +88,7 @@ agent-browser snapshot -i --delta         # full state once, then compact change
 agent-browser snapshot -i --delta --full  # force full state and refresh baseline
 ```
 
-Existing elements keep their refs across snapshots. Delta responses also include an exact tree splice.
+Refs remain stable across snapshots. Use `--delta` to reduce repeated output and `--full` to reset the baseline.
 
 Snapshot output looks like:
 

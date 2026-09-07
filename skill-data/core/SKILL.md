@@ -86,9 +86,9 @@ agent-browser snapshot -s "#main"         # scope to a CSS selector
 agent-browser snapshot -i --json          # machine-readable output
 ```
 
-Snapshot output looks like:
+Refs remain stable while their DOM nodes survive. Refresh them after navigation; JSON snapshots report disappeared refs in `removedRefs`. See [ref lifecycle](references/snapshot-refs.md) for details.
 
-DOM-backed refs survive repeated observations while the underlying node survives. JSON snapshots report disappeared IDs in `removedRefs`. Navigation to a new document invalidates its refs, and invalidated IDs are never reused during the browser session. Virtual accessibility nodes can still receive snapshot-local refs. Snapshot and URL diffs ignore generated ref annotations when comparing content; captured snapshots retain their actionable refs.
+Snapshot output looks like:
 
 ```
 Page: Example - Log in

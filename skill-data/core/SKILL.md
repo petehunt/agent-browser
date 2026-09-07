@@ -338,14 +338,13 @@ agent-browser network har stop /tmp/trace.har
 
 ```bash
 agent-browser open https://example.com
-agent-browser record start demo.webm          # 30 fps by default
 agent-browser record start demo.webm --contact-sheet
 agent-browser snapshot -i
 agent-browser click @e3
 agent-browser record stop
 ```
 
-Pass `--contact-sheet` to save selected changed frames with timestamps and highlighted change regions beside the WebM. Use `--contact-sheet-threshold <0-1>` to tune frame selection; the default is `0.05`. Pass `--fps 60` for motion-heavy takes (drag, animation, scroll work) or a lower rate for long sessions; `--fps` accepts 1 to 60.
+Add `--contact-sheet` for a timestamped PNG summary. Pass `--fps 60` for motion-heavy takes or a lower rate for long sessions; `--fps` accepts 1 to 60.
 
 See [references/video-recording.md](references/video-recording.md) for frame rate guidance, codec options, and more.
 

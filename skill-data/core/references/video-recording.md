@@ -43,9 +43,6 @@ agent-browser record start ./output.webm
 # Start recording at a specific rate (1-60)
 agent-browser record start ./output.webm --fps 60
 
-# Export a timestamped PNG summary beside the video
-agent-browser record start ./output.webm --contact-sheet
-
 # Stop current recording
 agent-browser record stop
 
@@ -78,7 +75,7 @@ The video uses the requested frame rate and holds the latest Chrome frame betwee
 
 ## Contact Sheets
 
-Pass `--contact-sheet` to create `<recording-name>.contact-sheet.png` beside the WebM. The first frame is always included. Later frames are selected when the ratio of visually changed pixels reaches the threshold. Each cell includes its recording timestamp and a red box around the changed region.
+Pass `--contact-sheet` to save `<recording-name>.contact-sheet.png` beside the video. It includes the first frame, then frames that meet the change threshold, with timestamps and red change outlines.
 
 ```bash
 agent-browser record start ./checkout.webm --contact-sheet
@@ -87,7 +84,7 @@ agent-browser record start ./checkout.webm --contact-sheet
 agent-browser record start ./checkout.webm --contact-sheet-threshold 0.02
 ```
 
-The threshold accepts values from `0` to `1` and defaults to `0.05`. Passing `--contact-sheet-threshold` implies `--contact-sheet`. At most 100 frames are included so long recordings remain reviewable.
+The threshold accepts values from `0` to `1` and defaults to `0.05`. Passing `--contact-sheet-threshold` implies `--contact-sheet`. At most 100 frames are included.
 
 ## Use Cases
 

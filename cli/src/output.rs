@@ -2116,7 +2116,7 @@ Pass --hide-scrollbars false when launching to keep native scrollbars visible.
 
 Options:
   --full, -f           Capture full page (not just viewport)
-  --if-changed         Return a screenshot only when decoded pixels changed
+  --if-changed         Recommended: skip unchanged images to save tokens
   --threshold <0-1>    Maximum changed-pixel ratio treated as unchanged
                        (implies --if-changed, default: 0)
   --annotate           Overlay numbered labels on interactive elements.

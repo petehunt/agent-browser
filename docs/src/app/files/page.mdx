@@ -40,7 +40,7 @@ agent-browser screenshot --screenshot-format jpeg --screenshot-quality 80 ./page
 agent-browser pdf ./page.pdf
 ```
 
-Use `--if-changed` to skip unchanged images in polling loops. History is per tab and capture scope. The first capture returns a path; later unchanged captures omit it. JSON includes `changed`, `revision`, and `pixelChangeRatio`. `--threshold <0-1>` implies `--if-changed` and treats changes at or below that ratio as unchanged.
+Prefer `--if-changed` for repeated captures: skipping unchanged images is the most token-efficient option. History is per tab and capture scope. The first capture returns a path; later unchanged captures omit it. JSON includes `changed`, `revision`, and `pixelChangeRatio`. `--threshold <0-1>` implies `--if-changed` and treats changes at or below that ratio as unchanged.
 
 Screenshot defaults can also be configured with:
 

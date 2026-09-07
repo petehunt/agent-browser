@@ -5237,8 +5237,10 @@ fn changed_pixel_ratio(
     }
     let changed = previous
         .rgba
-        .chunks_exact(4)
-        .zip(rgba.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(rgba.as_chunks::<4>().0)
         .filter(|(before, after)| before != after)
         .count();
     changed as f64 / (rgba.len() / 4) as f64

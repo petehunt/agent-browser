@@ -290,13 +290,13 @@ Headless Chromium screenshots hide native scrollbars for consistent image output
 
 ### Act and observe once
 
-Use `act` to execute multiple actions and capture page state only after the sequence completes. Final observation policies are checked before actions begin. Plain output includes the requested tree or delta, screenshot path, and individual failure details.
+Use `act` to run several actions and observe once. It stops on the first failure and retains individual results.
 
 ```bash
 agent-browser act 'fill @e1 "pete@example.com"' 'click @e2' --wait networkidle --observe delta --screenshot-if-changed --json
 ```
 
-Each action uses the normal parser, policy, and backend checks. Execution stops on the first failure and the response preserves individual action results. `--observe delta` returns a full tree the first time, then an unchanged result or a delta; `--observe full` forces the full tree. The response always includes the final URL when all actions succeed. Conditional screenshots omit their path when decoded pixels match the preceding `act` capture for that tab.
+`--observe delta` returns a full tree initially, then changes or an unchanged result; `--observe full` always returns the tree. `--screenshot-if-changed` skips unchanged images. See the [command reference](references/commands.md#action-and-observation-batch) for options and responses.
 
 ### Handle multiple pages via tabs
 

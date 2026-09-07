@@ -279,7 +279,7 @@ echo '[
 ]' | agent-browser batch --json
 ```
 
-Use `act` when a workflow needs several actions but only one final observation. Each quoted action runs through the normal parser, policy, and backend checks. The command stops after the first failure and preserves individual results, then returns the final URL plus any requested snapshot or conditional screenshot. Final observation policies are checked before actions begin. Plain output includes the requested tree or delta, screenshot path, and individual failure details.
+Use `act` to run several actions and observe the final page once. It stops on the first failure and retains results for attempted actions.
 
 ```bash
 agent-browser act \
@@ -292,7 +292,7 @@ agent-browser act \
   --json
 ```
 
-`--observe delta` returns a full snapshot on the first observation, a compact unchanged response when the tree matches, and a delta thereafter. Use `--observe full` to force the complete tree. Conditional screenshot history is isolated per tab and hashes decoded RGBA pixels.
+`--observe delta` returns a full tree initially, then changes or an unchanged result. Use `--observe full` for the complete tree and `--screenshot-if-changed` to skip unchanged images.
 
 ### Clipboard
 

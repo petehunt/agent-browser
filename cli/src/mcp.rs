@@ -1606,7 +1606,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_ACT,
             "Act and observe",
-            "Run multiple actions atomically and capture final page state once.",
+            "Run actions in order, stopping on failure, and capture final page state once. Completed actions are not rolled back.",
             json!({
                 "commands": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
                 "wait": { "type": "string", "enum": ["load", "domcontentloaded", "networkidle"] },

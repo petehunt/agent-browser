@@ -640,7 +640,7 @@ echo '[
 
 ## Action and observation batches
 
-Use `act` to execute several actions through one daemon request and capture page state once at the end. Every quoted command still uses the normal CLI parser, policy checks, and backend validation. Execution stops after the first failure while preserving individual results. Final observation policies are checked before actions begin. Plain output includes the requested tree or delta, screenshot path, and individual failure details.
+Use `act` to run several actions and observe the final page once. It stops on the first failure and retains results for attempted actions. Normal action policies apply.
 
 ```bash
 agent-browser act \

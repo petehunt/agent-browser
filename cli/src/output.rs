@@ -3415,7 +3415,9 @@ agent-browser act - Execute actions and observe once
 
 Usage: agent-browser act "<command>"... [options]
 
-Executes each quoted command through the normal CLI and daemon validation path, then optionally waits and captures the final URL, snapshot, and screenshot in one response. Execution stops after the first failed action while preserving results for actions already attempted. Final observation policies are checked before actions begin. Plain output includes observations and individual failure details.
+Runs quoted commands in order, then optionally waits and captures final page state.
+Stops on the first failure and retains results for attempted actions.
+Normal action policies apply; completed actions are not rolled back.
 
 Options:
   --wait <state>              Wait for load, domcontentloaded, or networkidle

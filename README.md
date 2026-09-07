@@ -920,6 +920,8 @@ Do not put vault tokens or passwords in plugin command args. Use the vault vendo
 
 The `snapshot` command supports filtering to reduce output size:
 
+DOM-backed refs are durable across observations: a surviving element retains its ref through React updates that preserve the node, reordering, and other DOM changes. Refs are namespaced by document and frame, invalidated when their document is replaced, and never recycled within the browser session. JSON snapshots include `removedRefs` for elements that disappeared since the previous observation. Virtual accessibility nodes without DOM backing remain snapshot-local.
+
 ```bash
 agent-browser snapshot                    # Full accessibility tree
 agent-browser snapshot -i                 # Interactive elements only (buttons, inputs, links)

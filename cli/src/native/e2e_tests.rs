@@ -1086,6 +1086,77 @@ async fn e2e_snapshot_and_click_ref() {
     assert_success(&resp);
 }
 
+#[tokio::test]
+#[ignore]
+async fn e2e_snapshot_refs_survive_dom_updates_and_never_recycle() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(
+            &json!({ "id": "1", "action": "launch", "headless": true }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "id": "2", "action": "navigate", "url": "about:blank" }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "id": "3", "action": "setcontent", "html": "<button id='a'>Alpha</button><button id='b'>Beta</button>" }),
+            &mut state,
+        )
+        .await,
+    );
+
+    let first = execute_command(&json!({ "id": "4", "action": "snapshot" }), &mut state).await;
+    assert_success(&first);
+    let alpha_ref = get_data(&first)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, node)| node["name"] == "Alpha")
+        .map(|(ref_id, _)| ref_id.clone())
+        .unwrap();
+
+    assert_success(
+        &execute_command(
+            &json!({ "id": "5", "action": "evaluate", "script": "document.body.prepend(document.getElementById('a')); document.getElementById('b').remove()" }),
+            &mut state,
+        )
+        .await,
+    );
+    let second = execute_command(&json!({ "id": "6", "action": "snapshot" }), &mut state).await;
+    assert_success(&second);
+    assert_eq!(get_data(&second)["refs"][&alpha_ref]["name"], "Alpha");
+    assert_eq!(
+        get_data(&second)["removedRefs"].as_array().unwrap().len(),
+        1
+    );
+
+    assert_success(
+        &execute_command(
+            &json!({ "id": "7", "action": "navigate", "url": "about:blank?new-document" }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "id": "8", "action": "setcontent", "html": "<button>Alpha</button>" }),
+            &mut state,
+        )
+        .await,
+    );
+    let third = execute_command(&json!({ "id": "9", "action": "snapshot" }), &mut state).await;
+    assert_success(&third);
+    assert!(get_data(&third)["refs"].get(&alpha_ref).is_none());
+    assert_success(&execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await);
+}
+
 // ---------------------------------------------------------------------------
 // Screenshot
 // ---------------------------------------------------------------------------

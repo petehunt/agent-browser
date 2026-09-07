@@ -5309,15 +5309,36 @@ fn snapshot_delta_response(
         }
     }
 
+    // Ref metadata contains only role/name, so it cannot describe checkbox
+    // state, text, values, hierarchy, or ordering. Include an exact tree splice
+    // alongside ref operations so every accepted revision can be reconstructed.
+    let before_lines: Vec<&str> = previous.tree.split('\n').collect();
+    let after_lines: Vec<&str> = tree.split('\n').collect();
+    let prefix = before_lines
+        .iter()
+        .zip(&after_lines)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let suffix = before_lines[prefix..]
+        .iter()
+        .rev()
+        .zip(after_lines[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let tree_change = json!({
+        "startLine": prefix,
+        "deleteCount": before_lines.len() - prefix - suffix,
+        "lines": after_lines[prefix..after_lines.len() - suffix],
+    });
     let delta = json!({
         "kind": "delta",
         "baseRevision": previous.revision,
         "revision": revision,
         "changes": changes,
+        "treeChange": tree_change,
     });
     let delta_size = serde_json::to_vec(&delta).map_or(usize::MAX, |bytes| bytes.len());
-    let structurally_unrepresented = delta["changes"].as_array().is_none_or(Vec::is_empty);
-    if structurally_unrepresented || delta_size >= tree.len().saturating_mul(7) / 10 {
+    if delta_size >= tree.len().saturating_mul(7) / 10 {
         json!({
             "snapshot": { "kind": "full", "revision": revision, "tree": tree, "refs": refs },
             "origin": origin,
@@ -13951,6 +13972,38 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
     }
 
     #[test]
+    fn snapshot_delta_tree_splice_preserves_changes_missing_from_ref_metadata() {
+        let padding = "- button \"Unchanged\" [ref=e99]\n".repeat(40);
+        let before = format!("{padding}- button \"Save\" [ref=e1]\n- checkbox \"Agree\" [ref=e2]");
+        let after = format!(
+            "{padding}- button \"Saved\" [ref=e1]\n- checkbox \"Agree\" [ref=e2] [checked]"
+        );
+        let previous = SnapshotRevision {
+            revision: 1, url: "about:blank".into(), options: "{}".into(), tree: before.clone(),
+            refs: serde_json::from_value(json!({"e1": {"role": "button", "name": "Save"}, "e2": {"role": "checkbox", "name": "Agree"}})).unwrap(),
+        };
+        let mut refs = previous.refs.clone();
+        refs["e1"]["name"] = json!("Saved");
+        for current in [after, before.replace("[ref=e2]", "[ref=e2] [checked]")] {
+            let result = snapshot_delta_response(&previous, 2, &current, &refs, &previous.url);
+            assert_eq!(result["snapshot"]["kind"], "delta");
+            let patch = &result["snapshot"]["treeChange"];
+            let start = patch["startLine"].as_u64().unwrap() as usize;
+            let count = patch["deleteCount"].as_u64().unwrap() as usize;
+            let mut reconstructed: Vec<&str> = before.split('\n').collect();
+            reconstructed.splice(
+                start..start + count,
+                patch["lines"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap()),
+            );
+            assert_eq!(reconstructed.join("\n"), current);
+        }
+    }
+
+    #[test]
     fn test_snapshot_delta_unchanged_is_tiny() {
         let previous = SnapshotRevision {
             revision: 4,
@@ -13973,7 +14026,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             revision: 1,
             url: "https://example.com".to_string(),
             options: "{}".to_string(),
-            tree: "x".repeat(1000),
+            tree: format!("{}\nold", "x".repeat(1000)),
             refs: serde_json::from_value(json!({
                 "e1": {"role": "button", "name": "Save"},
                 "e2": {"role": "alert", "name": "Old"}
@@ -13985,7 +14038,13 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             "e3": {"role": "status", "name": "Done"}
         }))
         .unwrap();
-        let result = snapshot_delta_response(&previous, 2, &"y".repeat(1000), &refs, &previous.url);
+        let result = snapshot_delta_response(
+            &previous,
+            2,
+            &format!("{}\nnew", "x".repeat(1000)),
+            &refs,
+            &previous.url,
+        );
         assert_eq!(result["snapshot"]["kind"], "delta");
         let changes = result["snapshot"]["changes"].as_array().unwrap();
         assert!(changes

@@ -88,7 +88,7 @@ agent-browser snapshot -i --delta         # full state once, then compact change
 agent-browser snapshot -i --delta --full  # force full state and refresh baseline
 ```
 
-Existing elements keep their refs across snapshots. Delta observations are scoped per tab and option set.
+Existing elements keep their refs across snapshots. Delta responses also include an exact tree splice.
 
 Snapshot output looks like:
 

@@ -105,7 +105,7 @@ agent-browser is checked @e1      # Check if checked
 agent-browser screenshot          # Save to temporary directory
 agent-browser screenshot path.png # Save to specific path
 agent-browser screenshot --full   # Full page
-agent-browser screenshot --if-changed # Omit the path when decoded pixels match the preceding capture
+agent-browser screenshot --if-changed # Recommended: skip unchanged images to save tokens
 agent-browser screenshot --threshold 0.01 # Ignore changes affecting at most 1% of pixels
 agent-browser pdf output.pdf      # Save as PDF
 ```

@@ -934,7 +934,7 @@ fn tools() -> Vec<Value> {
                 "format": { "type": "string", "enum": ["png", "jpeg"], "description": "Screenshot format." },
                 "quality": { "type": "integer", "minimum": 0, "maximum": 100, "description": "JPEG quality." },
                 "screenshotDir": { "type": "string", "description": "Default output directory when path is omitted." },
-                "ifChanged": { "type": "boolean", "default": false, "description": "Return image content only when decoded pixels changed since the preceding capture." },
+                "ifChanged": { "type": "boolean", "default": false, "description": "Recommended for repeated captures to save tokens: return image content only when pixels changed." },
                 "threshold": { "type": "number", "minimum": 0, "maximum": 1, "description": "Maximum changed-pixel ratio to treat as unchanged. Implies ifChanged." }
             }),
             &[],

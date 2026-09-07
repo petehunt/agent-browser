@@ -86,7 +86,7 @@ agent-browser snapshot -s "#main"         # scope to a CSS selector
 agent-browser snapshot -i --json          # machine-readable output
 ```
 
-Refs remain stable while their DOM nodes survive. Refresh them after navigation; JSON snapshots report disappeared refs in `removedRefs`. See [ref lifecycle](references/snapshot-refs.md) for details.
+Existing elements keep their refs across snapshots. Take a fresh snapshot after navigation.
 
 Snapshot output looks like:
 

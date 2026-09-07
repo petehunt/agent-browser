@@ -7009,6 +7009,11 @@ fn recording_options_from_command(cmd: &Value) -> Result<recording::RecordingOpt
 }
 
 async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    // Reject before creating a context or changing the active page.
+    if state.recording_state.active {
+        return Err("Recording already active".to_string());
+    }
+
     let path = cmd
         .get("path")
         .and_then(|v| v.as_str())
@@ -12241,6 +12246,18 @@ mod tests {
     /// plain text, not generated from `FIND_ACTIONS`; this pins their
     /// wording to the actual accepted set so an edit to one without the
     /// others fails here instead of drifting silently again.
+    #[tokio::test]
+    async fn recording_start_rejects_active_take_before_browser_work() {
+        let mut state = DaemonState::new();
+        state.recording_state.active = true;
+        let error = handle_recording_start(&json!({"path":"unused.webm"}), &mut state)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Recording already active");
+        assert!(state.recording_state.active);
+        assert!(state.browser.is_none());
+    }
+
     #[test]
     fn find_actions_help_text_matches_the_accepted_set() {
         assert_eq!(FIND_ACTIONS.join(", "), "click, fill, check, hover, text");

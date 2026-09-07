@@ -24,7 +24,7 @@ If no URL is provided, recording starts from the current page. The recording con
 
 ## Contact sheets
 
-Add `--contact-sheet` to save a timestamped PNG summary beside the WebM. The first frame is included, then visually changed frames are selected. A red outline in each cell shows the region that changed.
+Add `--contact-sheet` to save a timestamped PNG summary beside the WebM. The first and final frames are included, with visually changed frames between them. A light red tint and solid outline highlight distinct changed areas.
 
 ```bash
 agent-browser record start ./checkout.webm --contact-sheet

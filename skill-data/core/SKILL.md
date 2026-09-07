@@ -344,7 +344,7 @@ agent-browser click @e3
 agent-browser record stop
 ```
 
-Add `--contact-sheet` for a timestamped PNG summary. Pass `--fps 60` for motion-heavy takes or a lower rate for long sessions; `--fps` accepts 1 to 60.
+Add `--contact-sheet` for a timestamped PNG summary including the first and final frames. Pass `--fps 60` for motion-heavy takes or a lower rate for long sessions; `--fps` accepts 1 to 60.
 
 See [references/video-recording.md](references/video-recording.md) for frame rate guidance, codec options, and more.
 

@@ -2808,9 +2808,9 @@ The output file can be viewed in:
             r##"
 agent-browser record - Record browser session to video
 
-Usage: agent-browser record start <path.webm> [url] [--fps <n>] [--contact-sheet]
+Usage: agent-browser record start <path.webm> [url] [--fps <n>] [--cursor] [--contact-sheet]
        agent-browser record stop
-       agent-browser record restart <path.webm> [url] [--fps <n>] [--contact-sheet]
+       agent-browser record restart <path.webm> [url] [--fps <n>] [--cursor] [--contact-sheet]
 
 Record the browser to a WebM video file.
 Creates a fresh browser context but preserves cookies and localStorage.
@@ -2827,6 +2827,7 @@ Operations:
 
 Options:
   --fps <n>                       Capture rate, 1-60 (default: 30)
+  --cursor                        Show an animated pointer
   --contact-sheet                 Save distinct visual changes as a timestamped PNG
   --contact-sheet-threshold <n>   Changed-pixel ratio, 0-1 (default: 0.05)
 
@@ -2852,7 +2853,7 @@ Examples:
   agent-browser record start ./soak.webm --fps 10
 
   # Export a visual summary beside the video
-  agent-browser record start ./demo.webm --contact-sheet
+  agent-browser record start ./demo.webm --cursor --contact-sheet
 
   # Restart recording with a new file (stops previous, starts new)
   agent-browser record restart ./take2.webm
@@ -3756,7 +3757,7 @@ Debug:
   trace start                Start Chrome DevTools trace
   trace stop [path]          Stop and save Chrome DevTools trace
   profiler start|stop [path] Record Chrome DevTools profile
-  record start <path> [url]  Start video recording (WebM; supports contact sheets)
+  record start <path> [url]  Start video recording (WebM; supports cursor and contact sheet)
   record stop                Stop and save video
   console [--clear]          View console logs
   errors [--clear]           View page errors

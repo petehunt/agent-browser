@@ -121,6 +121,7 @@ agent-browser record restart ./take2.webm # Stop current + start new
 
 agent-browser record start ./scroll.webm --fps 60  # 60 fps for motion-heavy takes
 agent-browser record start ./soak.webm --fps 10    # Lower rate for long sessions
+agent-browser record start ./demo.webm --cursor    # Add an animated mouse pointer
 agent-browser record start ./demo.webm --contact-sheet # Save a timestamped PNG summary
 ```
 

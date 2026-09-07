@@ -16,7 +16,7 @@ serde_json = "1.0"
 dirs = "5.0"
 base64 = "0.22"
 getrandom = "0.2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "process", "fs"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false }
 rustls-pemfile = "2"
@@ -37,15 +37,13 @@ hex = "0.4"
 chrono = "0.4"
 urlencoding = "2"
 rust-embed = "8"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_Storage_FileSystem"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [build-dependencies]
 serde = { version = "1.0", features = ["derive"] }

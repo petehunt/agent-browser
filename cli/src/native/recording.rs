@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,30 +20,11 @@ pub const DEFAULT_FPS: u32 = 30;
 /// work) where the extra temporal detail is the point.
 pub const MAX_FPS: u32 = 60;
 
-/// Rate above which the encoder switches to its high-frame-rate profile:
-/// twice the bitrate budget and a second encoder thread, so the pipe does not
-/// become the bottleneck and stall the capture loop.
+/// Rate above which the deferred encoder uses a second thread.
 const HIGH_FPS_THRESHOLD: u32 = 30;
 
-/// Bitrate budget for WebM at [`HIGH_FPS_THRESHOLD`], scaled linearly with
-/// the requested rate. VP8 at 60 fps needs roughly twice the bits to hold the
-/// same per-frame quality.
-const WEBM_BITRATE_KBPS_AT_BASE_FPS: u32 = 1000;
-
-/// Longest gap the recorder fills with held frames, in seconds. A page that
-/// produces no frames for longer than this (a hang, or a tab left in the
-/// background) is held for this long and the remainder is dropped from the
-/// timeline, so a stalled page cannot inflate the file.
-const MAX_BACKFILL_SECS: u64 = 5;
-
-/// Screencast frames buffered ahead of the ticker. Two absorbs the jitter
-/// between Chrome's frame clock and the recorder's without letting a lower
-/// recording rate fall behind the page.
-const MAX_PENDING_FRAMES: usize = 2;
-
-/// JPEG quality requested from `Page.startScreencast`. Matches the quality the
-/// recorder used to request from `Page.captureScreenshot`.
-const SCREENCAST_QUALITY: u32 = 80;
+/// VP8 budget chosen for readable UI text and thin drawing strokes.
+const WEBM_BITRATE_KBPS: u32 = 8000;
 
 /// Upper bound on waiting for Chrome to acknowledge screencast teardown.
 /// The page may already be gone by the time a recording stops.
@@ -58,19 +39,6 @@ pub fn validate_fps(fps: u32) -> Result<u32, String> {
         ));
     }
     Ok(fps)
-}
-
-/// Wall-clock duration of one frame at `fps`.
-fn frame_period(fps: u32) -> Duration {
-    Duration::from_micros(1_000_000 / fps.clamp(1, MAX_FPS) as u64)
-}
-
-/// Frames owed to the constant-rate stream at `elapsed` into the recording,
-/// given `written` frames already sent. Zero when the current slot is filled.
-fn frames_due(elapsed: Duration, period: Duration, written: u64) -> u64 {
-    let period_us = period.as_micros().max(1);
-    let slot = (elapsed.as_micros() / period_us) as u64;
-    slot.saturating_add(1).saturating_sub(written)
 }
 
 /// The CDP session a recording attaches to its page target for its screencast.
@@ -201,29 +169,20 @@ fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Command 
             "-analyzeduration",
             "0",
         ])
-        .args([
-            "-f",
-            "image2pipe",
-            "-c:v",
-            "mjpeg",
-            "-framerate",
-            &fps.to_string(),
-            "-i",
-            "pipe:0",
-        ])
+        .args(["-f", "image2pipe", "-c:v", "png", "-framerate"])
+        .arg(fps.to_string())
+        .args(["-i", "pipe:0"])
         .args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"]);
 
     if output_path.ends_with(".webm") {
-        let bitrate = WEBM_BITRATE_KBPS_AT_BASE_FPS
-            .max(WEBM_BITRATE_KBPS_AT_BASE_FPS.saturating_mul(fps) / HIGH_FPS_THRESHOLD.max(1));
-        cmd.args(["-c:v", "libvpx", "-crf", "30"])
-            .args(["-b:v", &format!("{}k", bitrate)]);
+        cmd.args(["-c:v", "libvpx", "-crf", "18"])
+            .args(["-b:v", &format!("{}k", WEBM_BITRATE_KBPS)]);
     } else {
         cmd.args(["-c:v", "libx264", "-preset", "ultrafast"]);
     }
 
-    // One encoder thread keeps CPU away from the browser at ordinary rates;
-    // above 30 fps the encoder needs a second one to drain the pipe in time.
+    // One encoder thread is enough at ordinary rates; 60 fps benefits from a
+    // second thread during deferred encoding.
     cmd.args(["-pix_fmt", "yuv420p"])
         .args(["-threads", if high_fps { "2" } else { "1" }])
         .arg(output_path)
@@ -289,10 +248,19 @@ pub async fn attach_capture_session(
     }
 }
 
-/// Spawn a background task that screencasts `capture_session` into ffmpeg at
-/// `fps`. Chrome pushes a frame on every repaint up to the display rate; a
-/// wall-clock ticker writes one frame per slot, holding the last one through
-/// gaps, so the file's duration matches the automation it recorded.
+#[derive(Debug)]
+struct CapturedVideoFrame {
+    path: std::path::PathBuf,
+    elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct CapturedRecording {
+    frames: Vec<CapturedVideoFrame>,
+    duration: Duration,
+}
+
+/// Capture lossless frames first, then encode them after the take ends.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_recording_task(
     client: Arc<CdpClient>,
@@ -305,33 +273,15 @@ pub fn spawn_recording_task(
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
         let fps = validate_fps(fps)?;
-        let period = frame_period(fps);
-        let max_frames_per_tick = MAX_BACKFILL_SECS * fps as u64 + 1;
-
-        // Frames go to a private channel so the daemon's other subscribers
-        // neither copy them nor overflow on them. Subscribe before starting
-        // the screencast: Chrome sends the first frame immediately.
         let events = client.subscribe_session(&capture_session);
-
-        let mut command = build_ffmpeg_command(&output_path, fps);
-        let mut ffmpeg = command.spawn().map_err(|e| {
-            format!(
-                "ffmpeg not found or failed to execute: {}. Install ffmpeg to enable recording.",
-                e
-            )
-        })?;
-
-        let stdin = ffmpeg
-            .stdin
-            .take()
-            .ok_or_else(|| "Failed to open ffmpeg stdin".to_string())?;
+        let capture_dir = tempfile::tempdir()
+            .map_err(|e| format!("Failed to create recording frame directory: {}", e))?;
 
         let started = client
             .send_command(
                 "Page.startScreencast",
                 Some(json!({
-                    "format": "jpeg",
-                    "quality": SCREENCAST_QUALITY,
+                    "format": "png",
                     // Always 1: Chrome skips frames by count, and a static
                     // page produces exactly one, which a higher value would
                     // drop, leaving nothing to record.
@@ -343,23 +293,17 @@ pub fn spawn_recording_task(
 
         let capture = match started {
             Ok(_) => {
-                capture_frames(
+                collect_frames(
                     &client,
                     &capture_session,
                     events,
-                    stdin,
-                    period,
-                    max_frames_per_tick,
-                    &shared_count,
+                    capture_dir.path(),
                     &shared_captured,
                     cancel_rx,
                 )
                 .await
             }
-            Err(e) => {
-                drop(stdin);
-                Err(format!("Failed to start screencast: {}", e))
-            }
+            Err(e) => Err(format!("Failed to start screencast: {}", e)),
         };
 
         client.unsubscribe_session(&capture_session);
@@ -380,52 +324,24 @@ pub fn spawn_recording_task(
         )
         .await;
 
-        let output = ffmpeg
-            .wait_with_output()
-            .await
-            .map_err(|e| format!("ffmpeg wait failed: {}", e))?;
-
-        capture?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "ffmpeg failed: {}",
-                stderr.chars().take(300).collect::<String>()
-            ));
-        }
-
+        let capture = capture?;
+        let written = encode_capture(&capture, &output_path, fps).await?;
+        shared_count.store(written, Ordering::Relaxed);
         Ok(())
     })
 }
 
-/// Pump screencast frames into ffmpeg until cancelled, the page goes away, or
-/// the pipe closes. Takes ownership of `stdin` so ffmpeg sees EOF on return.
-#[allow(clippy::too_many_arguments)]
-async fn capture_frames(
+async fn collect_frames(
     client: &CdpClient,
     capture_session: &str,
     mut events: mpsc::Receiver<super::cdp::types::CdpEvent>,
-    mut stdin: tokio::process::ChildStdin,
-    period: Duration,
-    max_frames_per_tick: u64,
-    shared_count: &AtomicU64,
+    directory: &Path,
     shared_captured: &AtomicU64,
     cancel_rx: oneshot::Receiver<()>,
-) -> Result<(), String> {
+) -> Result<CapturedRecording, String> {
     let mut cancel_rx = std::pin::pin!(cancel_rx);
     let started = tokio::time::Instant::now();
-    let mut interval = tokio::time::interval(period);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    // Frames waiting to be written, in arrival order, and the last frame
-    // written (repeated through gaps). Chrome's frame clock and the ticker
-    // are not phase-locked, so a slot sometimes receives two frames and the
-    // next none; the queue carries the spare across instead of dropping it
-    // and repeating its predecessor.
-    let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
-    let mut last: Option<Vec<u8>> = None;
-    let mut written: u64 = 0;
+    let mut frames = Vec::new();
 
     loop {
         tokio::select! {
@@ -451,13 +367,14 @@ async fn capture_frames(
                                 .ok()
                         });
                     if let Some(bytes) = decoded {
-                        pending.push_back(bytes);
-                        // Only a lower recording rate lets the queue grow (a
-                        // 60 Hz screencast into a 30 fps file); dropping the
-                        // oldest keeps the picture current.
-                        if pending.len() > MAX_PENDING_FRAMES {
-                            pending.pop_front();
-                        }
+                        let index = frames.len();
+                        let path = directory.join(format!("frame-{index:08}.png"));
+                        tokio::fs::write(&path, bytes).await
+                            .map_err(|e| format!("Failed to spool recording frame: {}", e))?;
+                        frames.push(CapturedVideoFrame {
+                            path,
+                            elapsed: started.elapsed(),
+                        });
                         shared_captured.fetch_add(1, Ordering::Relaxed);
                     }
                 } else if event.method == "Inspector.detached" {
@@ -465,41 +382,72 @@ async fn capture_frames(
                     break;
                 }
             }
-            _ = interval.tick() => {
-                if pending.is_empty() && last.is_none() {
-                    continue;
-                }
-                let due = frames_due(started.elapsed(), period, written);
-                if due == 0 {
-                    continue;
-                }
-                // A gap longer than MAX_BACKFILL_SECS is held for that long
-                // and the rest is dropped, so a hung page does not inflate
-                // the file. Advancing `written` by the full amount is what
-                // stops the excess being paid off on later ticks.
-                let emit = due.min(max_frames_per_tick);
-                let mut write_failed = false;
-                for _ in 0..emit {
-                    if let Some(next) = pending.pop_front() {
-                        last = Some(next);
-                    }
-                    let Some(frame) = last.as_deref() else { break };
-                    if stdin.write_all(frame).await.is_err() {
-                        write_failed = true;
-                        break;
-                    }
-                }
-                if write_failed {
-                    break;
-                }
-                written += due;
-                shared_count.fetch_add(emit, Ordering::Relaxed);
-            }
         }
     }
 
+    if frames.is_empty() {
+        return Err("No frames captured".to_string());
+    }
+    Ok(CapturedRecording {
+        frames,
+        duration: started.elapsed(),
+    })
+}
+
+async fn encode_capture(
+    capture: &CapturedRecording,
+    output_path: &str,
+    fps: u32,
+) -> Result<u64, String> {
+    let mut command = build_ffmpeg_command(output_path, fps);
+    let mut ffmpeg = command.spawn().map_err(|e| {
+        format!(
+            "ffmpeg not found or failed to execute: {}. Install ffmpeg to enable recording.",
+            e
+        )
+    })?;
+    let mut stdin = ffmpeg
+        .stdin
+        .take()
+        .ok_or_else(|| "Failed to open ffmpeg stdin".to_string())?;
+    let total = (capture.duration.as_secs_f64() * fps as f64)
+        .ceil()
+        .max(1.0) as u64;
+    let mut page_index = 0usize;
+    let mut loaded_index = usize::MAX;
+    let mut clean_bytes = Vec::new();
+
+    for slot in 0..total {
+        let elapsed = Duration::from_secs_f64(slot as f64 / fps as f64);
+        while page_index + 1 < capture.frames.len()
+            && capture.frames[page_index + 1].elapsed <= elapsed
+        {
+            page_index += 1;
+        }
+        if loaded_index != page_index {
+            clean_bytes = std::fs::read(&capture.frames[page_index].path)
+                .map_err(|e| format!("Failed to read recording frame: {}", e))?;
+            loaded_index = page_index;
+        }
+        stdin
+            .write_all(&clean_bytes)
+            .await
+            .map_err(|e| format!("ffmpeg write failed: {}", e))?;
+    }
     drop(stdin);
-    Ok(())
+
+    let output = ffmpeg
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("ffmpeg wait failed: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "ffmpeg failed: {}",
+            stderr.chars().take(300).collect::<String>()
+        ));
+    }
+    Ok(total)
 }
 
 pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), String> {
@@ -652,75 +600,15 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_period_matches_fps() {
-        assert_eq!(frame_period(1), Duration::from_millis(1000));
-        assert_eq!(frame_period(30), Duration::from_micros(33333));
-        assert_eq!(frame_period(60), Duration::from_micros(16666));
-    }
-
-    #[test]
-    fn test_frames_due_on_schedule_emits_one_frame() {
-        let period = frame_period(30);
-        for slot in 0..5u64 {
-            let elapsed = period * slot as u32;
-            assert_eq!(frames_due(elapsed, period, slot), 1);
-        }
-    }
-
-    #[test]
-    fn test_frames_due_is_zero_when_slot_already_written() {
-        let period = frame_period(60);
-        // Two screencast frames in one slot: the second waits for the next
-        // tick rather than stretching the file.
-        assert_eq!(frames_due(period / 2, period, 1), 0);
-        assert_eq!(frames_due(Duration::ZERO, period, 10), 0);
-    }
-
-    #[test]
-    fn test_frames_due_backfills_missed_slots() {
-        let period = frame_period(60);
-        // The ticker wakes in slot 3 with only slot 0 written, so the two
-        // skipped slots are held along with the current one.
-        assert_eq!(frames_due(period * 3, period, 1), 3);
-    }
-
-    /// Replays the ticker's bookkeeping for a 60s stall followed by on-time
-    /// ticks. The cap must bound the file, not just one tick: without
-    /// advancing `written` by the full deficit, every later tick would emit
-    /// another five seconds of held frames until the stall was paid off.
-    #[test]
-    fn test_backfill_cap_bounds_a_long_stall() {
-        let fps = 30u32;
-        let period = frame_period(fps);
-        let max_frames = MAX_BACKFILL_SECS * fps as u64 + 1;
-        let mut written = 0u64;
-        let mut emitted = 0u64;
-
-        let mut elapsed = Duration::from_secs(60);
-        let due = frames_due(elapsed, period, written);
-        assert!(due > max_frames);
-        emitted += due.min(max_frames);
-        written += due;
-
-        for _ in 0..20 {
-            elapsed += period;
-            let due = frames_due(elapsed, period, written);
-            assert_eq!(due, 1, "ticks after the stall must emit one frame each");
-            emitted += due.min(max_frames);
-            written += due;
-        }
-
-        assert_eq!(emitted, max_frames + 20);
-    }
-
-    #[test]
     fn test_build_ffmpeg_command_webm() {
         let cmd = build_ffmpeg_command("/tmp/out.webm", DEFAULT_FPS);
         let args: Vec<&std::ffi::OsStr> = cmd.as_std().get_args().collect();
         let args_str: Vec<&str> = args.iter().filter_map(|a| a.to_str()).collect();
         assert!(args_str.contains(&"libvpx"));
         assert!(args_str.contains(&"/tmp/out.webm"));
-        assert!(args_str.contains(&"1000k"));
+        assert!(args_str.contains(&"png"));
+        assert!(args_str.contains(&"18"));
+        assert!(args_str.contains(&"8000k"));
     }
 
     #[test]
@@ -746,8 +634,7 @@ mod tests {
             .and_then(|i| args.get(i + 1))
             .map(String::as_str);
         assert_eq!(framerate, Some("60"));
-        // 60 fps doubles the VP8 bitrate budget and adds an encoder thread.
-        assert!(args.iter().any(|a| a == "2000k"));
+        assert!(args.iter().any(|a| a == "8000k"));
         let threads = args
             .iter()
             .position(|a| a == "-threads")

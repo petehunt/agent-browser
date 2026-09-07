@@ -2334,6 +2334,19 @@ fn policy_actions_for_command(
     needs_implicit_launch: bool,
 ) -> Vec<String> {
     let mut actions = vec![action.to_string()];
+    // Final observations must be authorized before any batch action runs.
+    if action == "act" {
+        actions.push("url".to_string());
+        if cmd.get("wait").and_then(Value::as_str).is_some() {
+            actions.push("waitforloadstate".to_string());
+        }
+        if cmd.get("observe").and_then(Value::as_str).is_some() {
+            actions.push("snapshot".to_string());
+        }
+        if cmd.get("screenshotIfChanged").and_then(Value::as_bool) == Some(true) {
+            actions.push("screenshot".to_string());
+        }
+    }
     // `a11y <url>` performs a real browser navigation before the audit. Keep
     // navigation deny and confirmation policies effective for the compound
     // command instead of treating it as a read-only audit.
@@ -14003,6 +14016,42 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
 
         drop(listener);
         let _ = fs::remove_dir_all(&socket_dir);
+    }
+
+    #[tokio::test]
+    async fn act_observation_policy_is_checked_before_launch_or_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        for action in ["snapshot", "screenshot", "waitforloadstate", "url"] {
+            for rule in ["deny", "confirm"] {
+                std::fs::write(
+                    &path,
+                    json!({"default": "allow", rule: [action]}).to_string(),
+                )
+                .unwrap();
+                let mut state = DaemonState::new();
+                state.policy = Some(ActionPolicy::load(path.to_str().unwrap()).unwrap());
+                let response = execute_command(
+                    &json!({
+                        "id": "review", "action": "act", "actions": [],
+                        "observe": "full", "screenshotIfChanged": true, "wait": "load"
+                    }),
+                    &mut state,
+                )
+                .await;
+                if rule == "deny" {
+                    assert_eq!(response["success"], false, "{response}");
+                    assert!(response["error"].as_str().unwrap().contains(action));
+                } else {
+                    assert_eq!(
+                        response["data"]["confirmation_required"], true,
+                        "{response}"
+                    );
+                    assert_eq!(response["data"]["action"], action);
+                }
+                assert!(state.browser.is_none());
+            }
+        }
     }
 
     #[test]

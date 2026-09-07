@@ -454,6 +454,59 @@ fn recording_fps_suffix(data: &serde_json::Value) -> String {
         .unwrap_or_default()
 }
 
+/// Format completed and partial action batches before generic URL/error output.
+fn format_act_text(data: &serde_json::Value) -> String {
+    let mut lines = Vec::new();
+    if let Some(actions) = data.get("actions").and_then(|v| v.as_array()) {
+        for item in actions {
+            let command = item.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let success = item.get("success").and_then(|v| v.as_bool()) == Some(true);
+            let indicator = if success {
+                color::success_indicator()
+            } else {
+                color::error_indicator()
+            };
+            lines.push(format!("{} {}", indicator, command));
+            if let Some(error) = item.get("error").and_then(|v| v.as_str()) {
+                lines.push(format!("  {}", error));
+            }
+            if item
+                .pointer("/result/confirmation_required")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                let id = item
+                    .pointer("/result/confirmation_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                lines.push(format!("  Confirmation required: {}", id));
+            }
+        }
+    }
+    if let Some(url) = data.get("url").and_then(|v| v.as_str()) {
+        lines.push(format!("URL: {}", url));
+    }
+    if let Some(snapshot) = data.get("snapshot") {
+        if let Some(tree) = snapshot.get("tree").and_then(|v| v.as_str()) {
+            lines.push(tree.to_string());
+        } else if let Some(diff) = snapshot.get("diff").and_then(|v| v.as_str()) {
+            lines.push(diff.to_string());
+        } else {
+            lines.push("Snapshot: unchanged".to_string());
+        }
+    }
+    if let Some(screenshot) = data.get("screenshot") {
+        lines.push(format!(
+            "Screenshot: {}",
+            screenshot
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unchanged")
+        ));
+    }
+    lines.join("\n")
+}
+
 pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &OutputOptions) {
     if opts.json {
         if opts.content_boundaries {
@@ -477,6 +530,24 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
             println!("{}", serde_json::to_string(resp).unwrap_or_default());
         }
         // JSON mode includes the warning field in the JSON payload already
+        return;
+    }
+
+    if action == Some("act")
+        && resp
+            .data
+            .as_ref()
+            .is_some_and(|data| data.get("actions").is_some())
+    {
+        let data = resp.data.as_ref().unwrap();
+        print_with_boundaries(
+            &format_act_text(data),
+            data.get("url").and_then(|v| v.as_str()),
+            opts,
+        );
+        if let Some(ref warning) = resp.warning {
+            eprintln!("{} {}", color::warning_indicator(), warning);
+        }
         return;
     }
 
@@ -1431,43 +1502,6 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
             .unwrap_or(false)
         {
             println!("{} Action denied", color::success_indicator());
-            return;
-        }
-
-        if action == Some("act") {
-            if let Some(actions) = data.get("actions").and_then(|v| v.as_array()) {
-                for item in actions {
-                    let command = item.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                    let success = item.get("success").and_then(|v| v.as_bool()) == Some(true);
-                    let indicator = if success {
-                        color::success_indicator()
-                    } else {
-                        color::error_indicator()
-                    };
-                    println!("{} {}", indicator, command);
-                }
-            }
-            if let Some(url) = data.get("url").and_then(|v| v.as_str()) {
-                println!("URL: {}", url);
-            }
-            if let Some(kind) = data.pointer("/snapshot/kind").and_then(|v| v.as_str()) {
-                println!("Snapshot: {}", kind);
-            }
-            if let Some(changed) = data
-                .pointer("/screenshot/changed")
-                .and_then(|v| v.as_bool())
-            {
-                if changed {
-                    println!(
-                        "Screenshot: {}",
-                        data.pointer("/screenshot/path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("changed")
-                    );
-                } else {
-                    println!("Screenshot: unchanged");
-                }
-            }
             return;
         }
 
@@ -3381,7 +3415,7 @@ agent-browser act - Execute actions and observe once
 
 Usage: agent-browser act "<command>"... [options]
 
-Executes each quoted command through the normal CLI and daemon validation path, then optionally waits and captures the final URL, snapshot, and screenshot in one response. Execution stops after the first failed action while preserving results for actions already attempted.
+Executes each quoted command through the normal CLI and daemon validation path, then optionally waits and captures the final URL, snapshot, and screenshot in one response. Execution stops after the first failed action while preserving results for actions already attempted. Final observation policies are checked before actions begin. Plain output includes observations and individual failure details.
 
 Options:
   --wait <state>              Wait for load, domcontentloaded, or networkidle
@@ -4547,5 +4581,38 @@ hydration: -  phases: 0  hydratedComponents: 0"
         ] {
             assert_eq!(format_webmcp_availability_text(&data), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod act_output_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn act_output_includes_observations_and_partial_failure_details() {
+        let full = format_act_text(&json!({
+            "actions": [{"command": "click @e1", "success": true}],
+            "url": "about:blank", "snapshot": {"kind": "full", "tree": "- button Save [ref=e1]"},
+            "screenshot": {"changed": true, "path": "/tmp/example.png"}
+        }));
+        for expected in [
+            "click @e1",
+            "URL: about:blank",
+            "- button Save [ref=e1]",
+            "/tmp/example.png",
+        ] {
+            assert!(full.contains(expected), "{full}");
+        }
+        let partial = format_act_text(&json!({"actions": [
+            {"command": "get url", "success": true},
+            {"command": "click #missing", "success": false, "error": "Element not found"}
+        ], "completed": false}));
+        for expected in ["get url", "click #missing", "Element not found"] {
+            assert!(partial.contains(expected), "{partial}");
+        }
+        let delta =
+            format_act_text(&json!({"snapshot": {"kind": "delta", "diff": "- old\n+ new"}}));
+        assert!(delta.contains("- old\n+ new"));
     }
 }

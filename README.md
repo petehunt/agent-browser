@@ -279,7 +279,7 @@ echo '[
 ]' | agent-browser batch --json
 ```
 
-Use `act` when a workflow needs several actions but only one final observation. Each quoted action runs through the normal parser, policy, and backend checks. The command stops after the first failure and preserves individual results, then returns the final URL plus any requested snapshot or conditional screenshot.
+Use `act` when a workflow needs several actions but only one final observation. Each quoted action runs through the normal parser, policy, and backend checks. The command stops after the first failure and preserves individual results, then returns the final URL plus any requested snapshot or conditional screenshot. Final observation policies are checked before actions begin. Plain output includes the requested tree or delta, screenshot path, and individual failure details.
 
 ```bash
 agent-browser act \

@@ -4391,6 +4391,19 @@ mod tests {
     }
 
     #[test]
+    fn act_mcp_observations_reach_the_canonical_parser() {
+        let args = act_command_args(
+            &json!({"commands": ["get url"], "observe": "full", "screenshotIfChanged": true}),
+        )
+        .unwrap();
+        let flags = crate::flags::parse_flags(&args);
+        let request = crate::commands::parse_command(&args, &flags).unwrap();
+        assert_eq!(request["action"], "act");
+        assert_eq!(request["observe"], "full");
+        assert_eq!(request["screenshotIfChanged"], true);
+    }
+
+    #[test]
     fn act_command_args_preserve_cli_parity() {
         let args = act_command_args(&json!({
             "commands": ["fill @e1 pete", "click @e2"],

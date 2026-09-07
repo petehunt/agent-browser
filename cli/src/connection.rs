@@ -1097,7 +1097,25 @@ fn has_os_error(error: &str, code: u32) -> bool {
 /// avoiding the daemon's spawn-time env snapshot drifting from the client.
 fn read_timeout_for(cmd: &Value) -> Duration {
     let op_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0);
-    Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
+    let mut budget = Duration::from_millis(op_ms.saturating_add(10_000).max(30_000));
+    // A batch holds the socket for all actions and final observations. Timing
+    // out at the ordinary 30s floor would retry already-executed mutations.
+    if cmd.get("action").and_then(Value::as_str) == Some("act") {
+        if let Some(actions) = cmd.get("actions").and_then(Value::as_array) {
+            for request in actions.iter().filter_map(|item| item.get("request")) {
+                budget = budget.saturating_add(read_timeout_for(request));
+            }
+        }
+        for requested in [
+            cmd.get("observe").and_then(Value::as_str).is_some(),
+            cmd.get("screenshotIfChanged").and_then(Value::as_bool) == Some(true),
+        ] {
+            if requested {
+                budget = budget.saturating_add(Duration::from_secs(30));
+            }
+        }
+    }
+    budget
 }
 
 fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
@@ -1604,5 +1622,22 @@ mod tests {
         assert!(!version_path.exists());
 
         let _ = fs::remove_dir(&dir);
+    }
+}
+
+#[cfg(test)]
+mod act_timeout_tests {
+    use super::*;
+    #[test]
+    fn batch_socket_budget_covers_all_action_waits_and_observations() {
+        let command = serde_json::json!({"action": "act", "actions": [
+            {"request": {"action": "wait", "timeout": 40000}},
+            {"request": {"action": "wait", "timeout": 40000}}
+        ], "timeout": 120000, "observe": "full", "screenshotIfChanged": true});
+        assert!(read_timeout_for(&command) > Duration::from_secs(200));
+        assert_eq!(
+            read_timeout_for(&serde_json::json!({"action": "click"})),
+            Duration::from_secs(30)
+        );
     }
 }

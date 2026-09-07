@@ -1986,6 +1986,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 "action": "act",
                 "actions": actions,
                 "wait": wait,
+                "timeout": flags.default_timeout,
                 "observe": observe,
                 "screenshotIfChanged": screenshot_if_changed
             }))

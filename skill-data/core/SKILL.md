@@ -290,7 +290,7 @@ Headless Chromium screenshots hide native scrollbars for consistent image output
 
 ### Act and observe once
 
-Use `act` to execute multiple actions and capture page state only after the sequence completes:
+Use `act` to execute multiple actions and capture page state only after the sequence completes. Final observation policies are checked before actions begin. Plain output includes the requested tree or delta, screenshot path, and individual failure details.
 
 ```bash
 agent-browser act 'fill @e1 "pete@example.com"' 'click @e2' --wait networkidle --observe delta --screenshot-if-changed --json

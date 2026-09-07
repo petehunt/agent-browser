@@ -46,7 +46,7 @@ agent-browser batch \
 agent-browser act 'fill @e1 "pete@example.com"' 'click @e2' --wait networkidle --observe delta --screenshot-if-changed --json
 ```
 
-`act` sends one daemon request, executes quoted commands serially, and observes once at the end. Options are `--wait <load|domcontentloaded|networkidle>`, `--observe <full|delta>`, and `--screenshot-if-changed`. The JSON result contains each action's command, success state, and result; `completed`; the final `url`; and requested `snapshot` or `screenshot` objects. It stops after the first failed or confirmation-requiring action. Nested `act` and `batch` commands are rejected.
+`act` sends one daemon request, executes quoted commands serially, and observes once at the end. Options are `--wait <load|domcontentloaded|networkidle>`, `--observe <full|delta>`, and `--screenshot-if-changed`. The JSON result contains each action's command, success state, and result; `completed`; the final `url`; and requested `snapshot` or `screenshot` objects. It stops after the first failed or confirmation-requiring action. Nested `act` and `batch` commands are rejected. Final observation policies are checked before actions begin. Plain output includes the requested tree or delta, screenshot path, and individual failure details.
 
 ## Snapshot (page analysis)
 

@@ -52,6 +52,8 @@ agent-browser snapshot --delta     # Full state once, then bounded structural de
 agent-browser snapshot --delta --full # Force full state and refresh baseline
 ```
 
+A `delta` includes ref metadata operations in `changes` and an exact `treeChange` splice. Split the previous tree on newlines, replace `deleteCount` lines starting at zero-based `startLine` with `lines`, then join with newlines. Apply both parts before advancing to the new revision; this preserves text, values, checked state, hierarchy, and ordering.
+
 ## Interactions (use @refs from snapshot)
 
 ```bash

@@ -841,7 +841,7 @@ fn tools() -> Vec<Value> {
                 "depth": { "type": "integer", "minimum": 0, "description": "Limit tree depth." },
                 "selector": { "type": "string", "description": "Scope the snapshot to a CSS selector." },
                 "includeUrls": { "type": "boolean", "default": false, "description": "Include href URLs on links." },
-                "delta": { "type": "boolean", "default": false, "description": "Return full state once, then unchanged or bounded structural deltas." },
+                "delta": { "type": "boolean", "default": false, "description": "Return full state once, then unchanged or bounded structural deltas. Apply changes to refs and treeChange (zero-based startLine, deleteCount, lines) to the previous tree." },
                 "full": { "type": "boolean", "default": false, "description": "Force full state while updating the delta baseline." }
             }),
             &[],
@@ -4735,5 +4735,29 @@ mod tests {
     fn initialize_defaults_to_latest_protocol_version() {
         let result = initialize_result(None, &McpConfig::default());
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_delta_schema_tests {
+    use super::*;
+    #[test]
+    fn delta_schema_explains_lossless_tree_patch() {
+        let snapshot = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == TOOL_SNAPSHOT)
+            .unwrap();
+        assert!(
+            snapshot["inputSchema"]["properties"]["delta"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("treeChange")
+        );
+        let args = vec!["snapshot".to_string(), "--delta".to_string()];
+        let flags = crate::flags::parse_flags(&args);
+        assert_eq!(
+            crate::commands::parse_command(&args, &flags).unwrap()["delta"],
+            true
+        );
     }
 }

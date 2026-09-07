@@ -2,7 +2,7 @@
 
 Compact element references that reduce context usage dramatically for AI agents.
 
-DOM-backed refs remain stable while their nodes survive, including through reordering. Refs are scoped to document and frame; replacing a document invalidates its refs. IDs are never reused within a session. JSON `removedRefs` lists refs absent since the previous observation. Accessibility nodes without DOM backing have snapshot-local refs. Content diffs ignore generated ref IDs without changing actionable refs.
+Existing elements keep their refs across snapshots. Take a fresh snapshot after navigation. JSON `removedRefs` lists refs no longer in the snapshot.
 
 **Related**: [commands.md](commands.md) for full command reference, [SKILL.md](../SKILL.md) for quick start.
 

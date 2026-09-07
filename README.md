@@ -918,9 +918,9 @@ Do not put vault tokens or passwords in plugin command args. Use the vault vendo
 
 ## Snapshot Options
 
-The `snapshot` command supports filtering to reduce output size:
+Existing elements keep their refs across snapshots. Take a fresh snapshot after navigation.
 
-Refs remain stable while their DOM nodes survive. A new document invalidates its refs; JSON snapshots list disappeared refs in `removedRefs`. Accessibility nodes without DOM backing have snapshot-local refs. Content diffs ignore generated ref IDs.
+Use filters to reduce snapshot output:
 
 ```bash
 agent-browser snapshot                    # Full accessibility tree

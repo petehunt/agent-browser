@@ -44,7 +44,7 @@ agent-browser mcp                     # Start an MCP stdio server
 
 Successful `open <url>` and `navigate` commands advertise when WebMCP tools are available. With `--json`, the navigation response includes `data.webmcp.toolCount`.
 
-Refs remain stable while their DOM nodes survive. A new document invalidates its refs; JSON snapshots list disappeared refs in `removedRefs`. Accessibility nodes without DOM backing have snapshot-local refs. Content diffs ignore generated ref IDs.
+Existing elements keep their refs across snapshots. Take a fresh snapshot after navigation.
 
 Clicks fail before dispatch when another element covers the target's click point. The error names the covering element, for example `covered by <div#consent-banner>`. Dismiss or interact with that element, take a fresh snapshot, then retry the original action.
 

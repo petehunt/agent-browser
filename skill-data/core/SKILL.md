@@ -88,7 +88,7 @@ agent-browser snapshot -i --json          # machine-readable output
 
 Snapshot output looks like:
 
-DOM-backed refs survive repeated observations while the underlying node survives. JSON snapshots report disappeared IDs in `removedRefs`. Navigation to a new document invalidates its refs, and invalidated IDs are never reused during the browser session. Virtual accessibility nodes can still receive snapshot-local refs.
+DOM-backed refs survive repeated observations while the underlying node survives. JSON snapshots report disappeared IDs in `removedRefs`. Navigation to a new document invalidates its refs, and invalidated IDs are never reused during the browser session. Virtual accessibility nodes can still receive snapshot-local refs. Snapshot and URL diffs ignore generated ref annotations when comparing content; captured snapshots retain their actionable refs.
 
 ```
 Page: Example - Log in

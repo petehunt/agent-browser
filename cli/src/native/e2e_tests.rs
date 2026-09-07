@@ -3931,7 +3931,7 @@ async fn e2e_diff_snapshot() {
     .await;
     assert_success(&resp);
 
-    // Repeated diffs must each begin a fresh ref-numbering epoch.
+    // Repeated diffs preserve document refs and report no content changes.
     for id in ["6", "7"] {
         let resp = execute_command(
             &json!({ "id": id, "action": "diff_snapshot", "baseline": baseline_path }),
@@ -4065,11 +4065,34 @@ async fn e2e_diff_url_aligns_refs_after_snapshot() {
     assert_eq!(data["diff"]["changed"], false);
     assert_eq!(data["diff"]["additions"], 0);
     assert_eq!(data["diff"]["removals"], 0);
-    assert_eq!(data["snapshot1"], data["snapshot2"]);
-    assert!(data["snapshot1"]
-        .as_str()
+    assert_ne!(
+        data["snapshot1"], data["snapshot2"],
+        "Replaced documents must not recycle actionable IDs"
+    );
+    assert_eq!(
+        super::diff::snapshot_comparison_text(data["snapshot1"].as_str().unwrap()),
+        super::diff::snapshot_comparison_text(data["snapshot2"].as_str().unwrap())
+    );
+    let primary_ref = state
+        .ref_map
+        .entries_sorted()
+        .into_iter()
+        .find(|(_, entry)| entry.name == "Primary action")
         .unwrap()
-        .starts_with("- button \"Primary action\" [ref=e1]"));
+        .0;
+    let next = execute_command(&json!({"id": "9", "action": "snapshot"}), &mut state).await;
+    assert_success(&next);
+    assert_eq!(
+        get_data(&next)["refs"][&primary_ref]["name"],
+        "Primary action"
+    );
+    assert_success(
+        &execute_command(
+            &json!({"id": "10", "action": "click", "selector": primary_ref}),
+            &mut state,
+        )
+        .await,
+    );
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);

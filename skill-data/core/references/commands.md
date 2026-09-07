@@ -121,9 +121,10 @@ agent-browser record restart ./take2.webm # Stop current + start new
 
 agent-browser record start ./scroll.webm --fps 60  # 60 fps for motion-heavy takes
 agent-browser record start ./soak.webm --fps 10    # Lower rate for long sessions
+agent-browser record start ./demo.webm --contact-sheet # Save a timestamped PNG summary
 ```
 
-`--fps` accepts 1 to 60 and defaults to 30. Playback duration always matches the wall clock time recorded, so a slow page holds frames instead of speeding the video up.
+`--fps` accepts 1 to 60 and defaults to 30. Playback duration always matches the wall clock time recorded, so a slow page holds frames instead of speeding the video up. `--contact-sheet-threshold <0-1>` changes how much of the image must differ before another contact-sheet frame is selected and implies `--contact-sheet`.
 
 ## Wait
 

@@ -22,6 +22,21 @@ agent-browser record start ./demo.webm https://example.com
 
 If no URL is provided, recording starts from the current page. The recording context copies cookies from the active session.
 
+## Contact sheets
+
+Add `--contact-sheet` to save a timestamped PNG summary beside the WebM. The first frame is included, then visually changed frames are selected. A red outline in each cell shows the region that changed.
+
+```bash
+agent-browser record start ./checkout.webm --contact-sheet
+
+# Select a frame when at least 2% of pixels change
+agent-browser record start ./checkout.webm --contact-sheet-threshold 0.02
+```
+
+The threshold accepts `0` to `1`, defaults to `0.05`, and implies `--contact-sheet`. Contact sheets contain at most 100 frames.
+
+![Example contact sheet with timestamps and highlighted change regions](/recording/contact-sheet-example.png)
+
 ## Frame rate
 
 Recording captures 30 frames per second by default, which is enough for scrolling, hover states, and CSS transitions to read as motion rather than as a slideshow. Use `--fps` to change it:
@@ -56,9 +71,9 @@ Valid rates are 1 to 60. The latest Chrome frame is held between repaints so the
     <tr><th>Command</th><th>Description</th></tr>
   </thead>
   <tbody>
-    <tr><td><code>record start &lt;path.webm&gt; [url] [--fps &lt;n&gt;]</code></td><td>Start recording to a WebM file</td></tr>
+    <tr><td><code>record start &lt;path.webm&gt; [url] [--fps &lt;n&gt;] [--contact-sheet]</code></td><td>Start recording to a WebM file</td></tr>
     <tr><td><code>record stop</code></td><td>Stop the active recording and save the file</td></tr>
-    <tr><td><code>record restart &lt;path.webm&gt; [url] [--fps &lt;n&gt;]</code></td><td>Stop the current recording and immediately start another</td></tr>
+    <tr><td><code>record restart &lt;path.webm&gt; [url] [--fps &lt;n&gt;] [--contact-sheet]</code></td><td>Stop the current recording and immediately start another</td></tr>
   </tbody>
 </table>
 

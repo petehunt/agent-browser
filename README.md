@@ -416,6 +416,7 @@ agent-browser profiler start          # Start Chrome DevTools profiling
 agent-browser profiler stop [path]    # Stop and save profile (.json)
 agent-browser record start ./demo.webm           # Start video recording at 30 fps
 agent-browser record start ./demo.webm --fps 60  # 60 fps for motion-heavy takes (1-60 allowed)
+agent-browser record start ./demo.webm --contact-sheet # Also save a timestamped PNG summary
 agent-browser record stop                        # Stop and save the video
 agent-browser record restart ./take2.webm        # Stop the current recording, start a new one
 agent-browser console                 # View console messages (log, error, warn, info)

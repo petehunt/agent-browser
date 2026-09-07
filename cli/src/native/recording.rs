@@ -20,6 +20,21 @@ pub const DEFAULT_FPS: u32 = 30;
 /// work) where the extra temporal detail is the point.
 pub const MAX_FPS: u32 = 60;
 
+/// Changed-pixel ratio that selects a contact-sheet frame when the caller
+/// does not provide one. Five percent filters minor animation while retaining
+/// meaningful UI transitions.
+pub const DEFAULT_CONTACT_SHEET_THRESHOLD: f64 = 0.05;
+
+/// Contact sheets stay reviewable and memory-bounded during long recordings.
+pub const MAX_CONTACT_SHEET_FRAMES: usize = 100;
+
+const CONTACT_SHEET_COLUMNS: u32 = 4;
+const CONTACT_SHEET_CELL_WIDTH: u32 = 320;
+const CONTACT_SHEET_LABEL_HEIGHT: u32 = 24;
+const CONTACT_SHEET_GAP: u32 = 8;
+const CONTACT_SHEET_DIFF_WIDTH: u32 = 160;
+const CONTACT_SHEET_PIXEL_DELTA: u8 = 24;
+
 /// Rate above which the deferred encoder uses a second thread.
 const HIGH_FPS_THRESHOLD: u32 = 30;
 
@@ -78,12 +93,18 @@ pub struct RecordingState {
     pub frame_count: u64,
     /// Distinct frames received from the screencast.
     pub captured_count: u64,
+    pub contact_sheet_frame_count: u64,
     pub capture_task: Option<tokio::task::JoinHandle<Result<(), String>>>,
     pub shared_frame_count: Option<Arc<AtomicU64>>,
     pub shared_captured_count: Option<Arc<AtomicU64>>,
+    pub shared_contact_sheet_count: Option<Arc<AtomicU64>>,
     pub cancel_tx: Option<oneshot::Sender<()>>,
     /// Shared with the daemon's event handlers.
     pub capture_session: SharedCaptureSession,
+    /// Whether the capture task exports selected frames as a PNG sheet.
+    pub contact_sheet: bool,
+    pub contact_sheet_threshold: f64,
+    pub contact_sheet_path: Option<String>,
 }
 
 impl RecordingState {
@@ -94,13 +115,60 @@ impl RecordingState {
             fps: DEFAULT_FPS,
             frame_count: 0,
             captured_count: 0,
+            contact_sheet_frame_count: 0,
             capture_task: None,
             shared_frame_count: None,
             shared_captured_count: None,
+            shared_contact_sheet_count: None,
             cancel_tx: None,
             capture_session: Arc::new(Mutex::new(None)),
+            contact_sheet: false,
+            contact_sheet_threshold: DEFAULT_CONTACT_SHEET_THRESHOLD,
+            contact_sheet_path: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RecordingOptions {
+    pub fps: Option<u32>,
+    pub contact_sheet: bool,
+    pub contact_sheet_threshold: f64,
+}
+
+impl Default for RecordingOptions {
+    fn default() -> Self {
+        Self {
+            fps: None,
+            contact_sheet: false,
+            contact_sheet_threshold: DEFAULT_CONTACT_SHEET_THRESHOLD,
+        }
+    }
+}
+
+pub fn validate_contact_sheet_threshold(threshold: f64) -> Result<f64, String> {
+    if threshold.is_finite() && (0.0..=1.0).contains(&threshold) {
+        Ok(threshold)
+    } else {
+        Err(format!(
+            "Invalid contact sheet threshold: {} is out of range (valid range: 0-1)",
+            threshold
+        ))
+    }
+}
+
+pub fn contact_sheet_path(output_path: &str) -> String {
+    let path = Path::new(output_path);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("recording");
+    let filename = format!("{}.contact-sheet.png", stem);
+    path.parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(filename)
+        .to_string_lossy()
+        .to_string()
 }
 
 /// [`CaptureSession::owns_attachment`] against the shared slot.
@@ -119,21 +187,36 @@ pub fn owns_attachment(shared: &SharedCaptureSession, target_id: &str, session_i
 pub fn recording_start(
     state: &mut RecordingState,
     path: &str,
-    fps: Option<u32>,
+    options: RecordingOptions,
 ) -> Result<Value, String> {
     if state.active {
         return Err("Recording already active".to_string());
     }
 
-    let fps = validate_fps(fps.unwrap_or(DEFAULT_FPS))?;
+    let fps = validate_fps(options.fps.unwrap_or(DEFAULT_FPS))?;
+    let threshold = validate_contact_sheet_threshold(options.contact_sheet_threshold)?;
 
     state.active = true;
     state.output_path = path.to_string();
     state.fps = fps;
     state.frame_count = 0;
     state.captured_count = 0;
+    state.contact_sheet_frame_count = 0;
+    state.contact_sheet = options.contact_sheet;
+    state.contact_sheet_threshold = threshold;
+    state.contact_sheet_path = options.contact_sheet.then(|| contact_sheet_path(path));
 
-    Ok(json!({ "started": true, "path": path, "fps": fps }))
+    let mut result = json!({
+        "started": true,
+        "path": path,
+        "fps": fps,
+        "contactSheet": options.contact_sheet
+    });
+    if let Some(ref contact_path) = state.contact_sheet_path {
+        result["contactSheetPath"] = json!(contact_path);
+        result["contactSheetThreshold"] = json!(threshold);
+    }
+    Ok(result)
 }
 
 pub fn recording_stop(state: &mut RecordingState) -> Result<Value, String> {
@@ -147,12 +230,18 @@ pub fn recording_stop(state: &mut RecordingState) -> Result<Value, String> {
         return Err("No frames captured".to_string());
     }
 
-    Ok(json!({
+    let mut result = json!({
         "path": &state.output_path,
         "frames": state.frame_count,
         "capturedFrames": state.captured_count,
         "fps": state.fps,
-    }))
+    });
+    if let Some(ref path) = state.contact_sheet_path {
+        result["contactSheetPath"] = json!(path);
+        result["contactSheetFrames"] = json!(state.contact_sheet_frame_count);
+        result["contactSheetThreshold"] = json!(state.contact_sheet_threshold);
+    }
+    Ok(result)
 }
 
 fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Command {
@@ -192,6 +281,270 @@ fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Command 
         .kill_on_drop(true);
 
     cmd
+}
+
+#[derive(Debug)]
+struct ContactSheetFrame {
+    jpeg: Vec<u8>,
+    elapsed_ms: u64,
+    /// Changed-region bounds normalized to the source frame.
+    changed_region: [f32; 4],
+}
+
+struct ContactSheetCollector {
+    threshold: f64,
+    selected: Vec<ContactSheetFrame>,
+    previous_selected: Option<image::RgbImage>,
+}
+
+impl ContactSheetCollector {
+    fn new(threshold: f64) -> Self {
+        Self {
+            threshold,
+            selected: Vec::new(),
+            previous_selected: None,
+        }
+    }
+
+    fn consider(&mut self, jpeg: &[u8], elapsed: Duration) {
+        if self.selected.len() >= MAX_CONTACT_SHEET_FRAMES {
+            return;
+        }
+        let Ok(source) = image::load_from_memory(jpeg) else {
+            return;
+        };
+        let source_width = source.width().max(1);
+        let source_height = source.height().max(1);
+        let diff_height = ((source_height as f64 * CONTACT_SHEET_DIFF_WIDTH as f64
+            / source_width as f64)
+            .round() as u32)
+            .max(1);
+        let thumbnail = source
+            .resize_exact(
+                CONTACT_SHEET_DIFF_WIDTH,
+                diff_height,
+                image::imageops::FilterType::Triangle,
+            )
+            .to_rgb8();
+
+        let selection = match self.previous_selected.as_ref() {
+            None => Some([0.0, 0.0, 1.0, 1.0]),
+            Some(previous) => {
+                let (ratio, region) = changed_pixel_region(previous, &thumbnail);
+                (ratio > 0.0 && ratio >= self.threshold).then_some(region)
+            }
+        };
+        if let Some(changed_region) = selection {
+            self.previous_selected = Some(thumbnail);
+            self.selected.push(ContactSheetFrame {
+                jpeg: jpeg.to_vec(),
+                elapsed_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
+                changed_region,
+            });
+        }
+    }
+}
+
+/// Ratio and normalized bounding rectangle of pixels that changed enough to
+/// matter visually. Comparing thumbnails bounds work at high capture rates.
+fn changed_pixel_region(before: &image::RgbImage, after: &image::RgbImage) -> (f64, [f32; 4]) {
+    if before.dimensions() != after.dimensions() {
+        return (1.0, [0.0, 0.0, 1.0, 1.0]);
+    }
+    let (width, height) = after.dimensions();
+    if width == 0 || height == 0 {
+        return (0.0, [0.0, 0.0, 0.0, 0.0]);
+    }
+    let mut changed = 0u64;
+    let mut min_x = width;
+    let mut min_y = height;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    for y in 0..height {
+        for x in 0..width {
+            let a = before.get_pixel(x, y).0;
+            let b = after.get_pixel(x, y).0;
+            let delta = a
+                .iter()
+                .zip(b.iter())
+                .map(|(left, right)| left.abs_diff(*right))
+                .max()
+                .unwrap_or(0);
+            if delta >= CONTACT_SHEET_PIXEL_DELTA {
+                changed += 1;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    if changed == 0 {
+        return (0.0, [0.0, 0.0, 0.0, 0.0]);
+    }
+    let ratio = changed as f64 / (width as u64 * height as u64) as f64;
+    let region = [
+        min_x as f32 / width as f32,
+        min_y as f32 / height as f32,
+        (max_x - min_x + 1) as f32 / width as f32,
+        (max_y - min_y + 1) as f32 / height as f32,
+    ];
+    (ratio, region)
+}
+
+fn format_contact_timestamp(milliseconds: u64) -> String {
+    let hours = milliseconds / 3_600_000;
+    let minutes = (milliseconds / 60_000) % 60;
+    let seconds = (milliseconds / 1_000) % 60;
+    let millis = milliseconds % 1_000;
+    format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, seconds, millis)
+}
+
+fn glyph_rows(character: char) -> [u8; 7] {
+    match character {
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
+        ':' => [0, 0b00100, 0b00100, 0, 0b00100, 0b00100, 0],
+        '.' => [0, 0, 0, 0, 0, 0b00100, 0b00100],
+        _ => [0; 7],
+    }
+}
+
+fn draw_timestamp(image: &mut image::RgbaImage, x: u32, y: u32, value: &str) {
+    const SCALE: u32 = 2;
+    for (index, character) in value.chars().enumerate() {
+        for (row, bits) in glyph_rows(character).iter().enumerate() {
+            for column in 0..5 {
+                if bits & (1 << (4 - column)) == 0 {
+                    continue;
+                }
+                for dy in 0..SCALE {
+                    for dx in 0..SCALE {
+                        let px = x + index as u32 * 6 * SCALE + column * SCALE + dx;
+                        let py = y + row as u32 * SCALE + dy;
+                        if px < image.width() && py < image.height() {
+                            image.put_pixel(px, py, image::Rgba([255, 255, 255, 255]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn draw_changed_region(image: &mut image::RgbaImage, x: u32, y: u32, width: u32, height: u32) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let right = (x + width - 1).min(image.width().saturating_sub(1));
+    let bottom = (y + height - 1).min(image.height().saturating_sub(1));
+    for thickness in 0..3 {
+        let left = x.saturating_sub(thickness);
+        let top = y.saturating_sub(thickness);
+        let r = (right + thickness).min(image.width().saturating_sub(1));
+        let b = (bottom + thickness).min(image.height().saturating_sub(1));
+        for px in left..=r {
+            image.put_pixel(px, top, image::Rgba([239, 68, 68, 255]));
+            image.put_pixel(px, b, image::Rgba([239, 68, 68, 255]));
+        }
+        for py in top..=b {
+            image.put_pixel(left, py, image::Rgba([239, 68, 68, 255]));
+            image.put_pixel(r, py, image::Rgba([239, 68, 68, 255]));
+        }
+    }
+}
+
+fn write_contact_sheet(path: &Path, frames: &[ContactSheetFrame]) -> Result<(), String> {
+    let first = frames
+        .first()
+        .ok_or("No frames selected for contact sheet")?;
+    let first_image = image::load_from_memory(&first.jpeg)
+        .map_err(|e| format!("Failed to decode contact sheet frame: {}", e))?;
+    let cell_height = ((CONTACT_SHEET_CELL_WIDTH as f64 * first_image.height() as f64
+        / first_image.width().max(1) as f64)
+        .round() as u32)
+        .max(1);
+    let columns = CONTACT_SHEET_COLUMNS.min(frames.len() as u32).max(1);
+    let rows = (frames.len() as u32).div_ceil(columns);
+    let canvas_width = CONTACT_SHEET_GAP + columns * (CONTACT_SHEET_CELL_WIDTH + CONTACT_SHEET_GAP);
+    let canvas_height =
+        CONTACT_SHEET_GAP + rows * (CONTACT_SHEET_LABEL_HEIGHT + cell_height + CONTACT_SHEET_GAP);
+    let mut canvas =
+        image::RgbaImage::from_pixel(canvas_width, canvas_height, image::Rgba([17, 24, 39, 255]));
+
+    for (index, frame) in frames.iter().enumerate() {
+        let source = image::load_from_memory(&frame.jpeg)
+            .map_err(|e| format!("Failed to decode contact sheet frame: {}", e))?;
+        let rendered = source
+            .resize(
+                CONTACT_SHEET_CELL_WIDTH,
+                cell_height,
+                image::imageops::FilterType::Triangle,
+            )
+            .to_rgba8();
+        let column = index as u32 % columns;
+        let row = index as u32 / columns;
+        let cell_x = CONTACT_SHEET_GAP + column * (CONTACT_SHEET_CELL_WIDTH + CONTACT_SHEET_GAP);
+        let label_y = CONTACT_SHEET_GAP
+            + row * (CONTACT_SHEET_LABEL_HEIGHT + cell_height + CONTACT_SHEET_GAP);
+        let image_y = label_y + CONTACT_SHEET_LABEL_HEIGHT;
+        let image_x = cell_x + (CONTACT_SHEET_CELL_WIDTH - rendered.width()) / 2;
+        image::imageops::overlay(&mut canvas, &rendered, image_x.into(), image_y.into());
+        draw_timestamp(
+            &mut canvas,
+            cell_x + 4,
+            label_y + 4,
+            &format_contact_timestamp(frame.elapsed_ms),
+        );
+
+        let [rx, ry, rw, rh] = frame.changed_region;
+        draw_changed_region(
+            &mut canvas,
+            image_x + (rx * rendered.width() as f32).round() as u32,
+            image_y + (ry * rendered.height() as f32).round() as u32,
+            (rw * rendered.width() as f32).round().max(1.0) as u32,
+            (rh * rendered.height() as f32).round().max(1.0) as u32,
+        );
+    }
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create contact sheet directory: {}", e))?;
+    }
+    canvas
+        .save(path)
+        .map_err(|e| format!("Failed to save contact sheet: {}", e))
 }
 
 /// Attach the recorder's own flattened session to the target behind
@@ -269,6 +622,9 @@ pub fn spawn_recording_task(
     fps: u32,
     shared_count: Arc<AtomicU64>,
     shared_captured: Arc<AtomicU64>,
+    contact_sheet_path: Option<String>,
+    contact_sheet_threshold: f64,
+    shared_contact_sheet_count: Arc<AtomicU64>,
     cancel_rx: oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
@@ -327,6 +683,13 @@ pub fn spawn_recording_task(
         let capture = capture?;
         let written = encode_capture(&capture, &output_path, fps).await?;
         shared_count.store(written, Ordering::Relaxed);
+
+        if let Some(path) = contact_sheet_path {
+            let contact_frames =
+                select_contact_frames(&capture.frames, contact_sheet_threshold)?;
+            write_contact_sheet(Path::new(&path), &contact_frames)?;
+            shared_contact_sheet_count.store(contact_frames.len() as u64, Ordering::Relaxed);
+        }
         Ok(())
     })
 }
@@ -394,6 +757,19 @@ async fn collect_frames(
     })
 }
 
+fn select_contact_frames(
+    frames: &[CapturedVideoFrame],
+    threshold: f64,
+) -> Result<Vec<ContactSheetFrame>, String> {
+    let mut collector = ContactSheetCollector::new(threshold);
+    for frame in frames {
+        let clean = std::fs::read(&frame.path)
+            .map_err(|e| format!("Failed to read contact sheet frame: {}", e))?;
+        collector.consider(&clean, frame.elapsed);
+    }
+    Ok(collector.selected)
+}
+
 async fn encode_capture(
     capture: &CapturedRecording,
     output_path: &str,
@@ -457,6 +833,7 @@ pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), Strin
 
     let counter = state.shared_frame_count.take();
     let captured = state.shared_captured_count.take();
+    let contact_sheet = state.shared_contact_sheet_count.take();
     let handle = state.capture_task.take();
 
     let result = if let Some(h) = handle {
@@ -475,6 +852,9 @@ pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), Strin
     if let Some(c) = captured {
         state.captured_count = c.load(Ordering::Relaxed);
     }
+    if let Some(c) = contact_sheet {
+        state.contact_sheet_frame_count = c.load(Ordering::Relaxed);
+    }
     if let Ok(mut guard) = state.capture_session.lock() {
         *guard = None;
     }
@@ -484,6 +864,13 @@ pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn options(fps: Option<u32>) -> RecordingOptions {
+        RecordingOptions {
+            fps,
+            ..RecordingOptions::default()
+        }
+    }
 
     #[test]
     fn test_recording_state_new() {
@@ -497,7 +884,7 @@ mod tests {
     #[test]
     fn test_recording_start_sets_active() {
         let mut state = RecordingState::new();
-        let result = recording_start(&mut state, "/tmp/test.mp4", None);
+        let result = recording_start(&mut state, "/tmp/test.mp4", options(None));
         assert!(result.is_ok());
         assert!(state.active);
         assert_eq!(state.output_path, "/tmp/test.mp4");
@@ -509,19 +896,73 @@ mod tests {
     #[test]
     fn test_recording_start_honors_requested_fps() {
         let mut state = RecordingState::new();
-        let result = recording_start(&mut state, "/tmp/test.webm", Some(60)).unwrap();
+        let result = recording_start(&mut state, "/tmp/test.webm", options(Some(60))).unwrap();
         assert_eq!(state.fps, 60);
         assert_eq!(result["fps"], 60);
     }
 
     #[test]
+    fn test_recording_start_sets_contact_sheet_options() {
+        let mut state = RecordingState::new();
+        let result = recording_start(
+            &mut state,
+            "/tmp/demo.webm",
+            RecordingOptions {
+                contact_sheet: true,
+                contact_sheet_threshold: 0.12,
+                ..RecordingOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(state.contact_sheet);
+        assert_eq!(state.contact_sheet_threshold, 0.12);
+        assert_eq!(
+            state.contact_sheet_path.as_deref(),
+            Some("/tmp/demo.contact-sheet.png")
+        );
+        assert_eq!(result["contactSheetPath"], "/tmp/demo.contact-sheet.png");
+    }
+
+    #[test]
+    fn test_contact_sheet_path_replaces_extension() {
+        assert_eq!(contact_sheet_path("demo.webm"), "demo.contact-sheet.png");
+        assert_eq!(
+            contact_sheet_path("artifacts/demo.capture.webm"),
+            "artifacts/demo.capture.contact-sheet.png"
+        );
+    }
+
+    #[test]
+    fn test_validate_contact_sheet_threshold_range() {
+        assert_eq!(validate_contact_sheet_threshold(0.0).unwrap(), 0.0);
+        assert_eq!(validate_contact_sheet_threshold(1.0).unwrap(), 1.0);
+        assert!(validate_contact_sheet_threshold(-0.01).is_err());
+        assert!(validate_contact_sheet_threshold(1.01).is_err());
+        assert!(validate_contact_sheet_threshold(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn test_changed_pixel_region_reports_ratio_and_bounds() {
+        let before = image::RgbImage::from_pixel(10, 10, image::Rgb([0, 0, 0]));
+        let mut after = before.clone();
+        for y in 3..7 {
+            for x in 2..5 {
+                after.put_pixel(x, y, image::Rgb([255, 255, 255]));
+            }
+        }
+        let (ratio, bounds) = changed_pixel_region(&before, &after);
+        assert!((ratio - 0.12).abs() < f64::EPSILON);
+        assert_eq!(bounds, [0.2, 0.3, 0.3, 0.4]);
+    }
+
+    #[test]
     fn test_recording_start_rejects_out_of_range_fps() {
         let mut state = RecordingState::new();
-        let too_high = recording_start(&mut state, "/tmp/test.webm", Some(61));
+        let too_high = recording_start(&mut state, "/tmp/test.webm", options(Some(61)));
         assert!(too_high.unwrap_err().contains("valid range: 1-60"));
         assert!(!state.active);
 
-        let zero = recording_start(&mut state, "/tmp/test.webm", Some(0));
+        let zero = recording_start(&mut state, "/tmp/test.webm", options(Some(0)));
         assert!(zero.is_err());
         assert!(!state.active);
     }
@@ -529,8 +970,8 @@ mod tests {
     #[test]
     fn test_recording_start_while_active() {
         let mut state = RecordingState::new();
-        recording_start(&mut state, "/tmp/test1.mp4", None).unwrap();
-        let result = recording_start(&mut state, "/tmp/test2.mp4", None);
+        recording_start(&mut state, "/tmp/test1.mp4", options(None)).unwrap();
+        let result = recording_start(&mut state, "/tmp/test2.mp4", options(None));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already active"));
     }
@@ -546,7 +987,7 @@ mod tests {
     #[test]
     fn test_recording_stop_no_frames() {
         let mut state = RecordingState::new();
-        recording_start(&mut state, "/tmp/test.mp4", None).unwrap();
+        recording_start(&mut state, "/tmp/test.mp4", options(None)).unwrap();
         let result = recording_stop(&mut state);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No frames"));
@@ -556,7 +997,7 @@ mod tests {
     #[test]
     fn test_recording_stop_reports_fps() {
         let mut state = RecordingState::new();
-        recording_start(&mut state, "/tmp/test.webm", Some(60)).unwrap();
+        recording_start(&mut state, "/tmp/test.webm", options(Some(60))).unwrap();
         state.frame_count = 120;
         let result = recording_stop(&mut state).unwrap();
         assert_eq!(result["frames"], 120);

@@ -34,18 +34,24 @@ const CONTACT_SHEET_CELL_WIDTH: u32 = 640;
 const CONTACT_SHEET_LABEL_HEIGHT: u32 = 24;
 const CONTACT_SHEET_GAP: u32 = 8;
 const CONTACT_SHEET_DIFF_WIDTH: u32 = 320;
-const CONTACT_SHEET_PIXEL_DELTA: u8 = 24;
 const CONTACT_SHEET_TILE_SIZE: u32 = 8;
 const CONTACT_SHEET_MIN_TILE_PIXELS: u32 = 4;
 const CONTACT_SHEET_MIN_REGION_PIXELS: u64 = 8;
 const CONTACT_SHEET_REGION_PADDING_TILES: u32 = 1;
 const CONTACT_SHEET_REGION_MERGE_GAP_TILES: u32 = 4;
 
-/// Rate above which the deferred encoder uses a second thread.
+/// Rate above which the live encoder uses additional threads.
 const HIGH_FPS_THRESHOLD: u32 = 30;
+const HIGH_FPS_ENCODER_THREADS: &str = "4";
 
 /// VP8 budget chosen for readable UI text and thin drawing strokes.
 const WEBM_BITRATE_KBPS: u32 = 8000;
+
+/// Captured frames may wait briefly for compositing, but overload must fail
+/// the recording instead of silently degrading it into held frames.
+const ENCODER_FRAME_BUFFER: usize = 16;
+const MAX_ENCODER_LAG: Duration = Duration::from_millis(500);
+const ENCODER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Upper bound on waiting for Chrome to acknowledge screencast teardown.
 /// The page may already be gone by the time a recording stops.
@@ -60,6 +66,10 @@ pub fn validate_fps(fps: u32) -> Result<u32, String> {
         ));
     }
     Ok(fps)
+}
+
+fn frame_period(fps: u32) -> Duration {
+    Duration::from_micros(1_000_000 / fps.clamp(1, MAX_FPS) as u64)
 }
 
 /// The CDP session a recording attaches to its page target for its screencast.
@@ -90,7 +100,7 @@ impl CaptureSession {
 
 pub type SharedCaptureSession = Arc<Mutex<Option<CaptureSession>>>;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RecordingCursorState {
     pub x: f64,
     pub y: f64,
@@ -329,7 +339,7 @@ fn composite_cursor(frame: &mut image::RgbImage, cursor: RecordingCursorState) {
 }
 
 /// PPM carries exact RGB pixels to FFmpeg and supports frame-size changes.
-/// Only the final video encoder compresses the composited frame.
+/// Only the video encoder compresses the composited frame.
 fn cursor_video_frame(source: &[u8], cursor: RecordingCursorState) -> Result<Vec<u8>, String> {
     let mut frame = image::load_from_memory(source)
         .map_err(|e| format!("Failed to decode recording frame: {}", e))?
@@ -345,9 +355,9 @@ pub struct RecordingState {
     pub output_path: String,
     /// Capture rate for the active (or most recent) recording.
     pub fps: u32,
-    /// Frames written to the file, including frames held through gaps.
+    /// Frames written to the file.
     pub frame_count: u64,
-    /// Distinct frames received from the screencast.
+    /// Frames received from the screencast.
     pub captured_count: u64,
     pub contact_sheet_frame_count: u64,
     pub capture_task: Option<tokio::task::JoinHandle<Result<(), String>>>,
@@ -522,6 +532,7 @@ fn build_ffmpeg_command(output_path: &str, fps: u32, cursor: bool) -> tokio::pro
 
     cmd.args(["-y", "-loglevel", "error"])
         .args(["-avioflags", "direct"])
+        .args(["-use_wallclock_as_timestamps", "1"])
         .args([
             "-fpsprobesize",
             "0",
@@ -540,19 +551,28 @@ fn build_ffmpeg_command(output_path: &str, fps: u32, cursor: bool) -> tokio::pro
             "-i",
             "pipe:0",
         ])
-        .args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"]);
+        .args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"])
+        .args(["-fps_mode", "vfr"]);
 
     if output_path.ends_with(".webm") {
         cmd.args(["-c:v", "libvpx", "-crf", "18"])
-            .args(["-b:v", &format!("{}k", WEBM_BITRATE_KBPS)]);
+            .args(["-b:v", &format!("{}k", WEBM_BITRATE_KBPS)])
+            .args(["-deadline", "realtime", "-cpu-used", "4"]);
     } else {
         cmd.args(["-c:v", "libx264", "-preset", "ultrafast"]);
     }
 
     // One encoder thread keeps CPU away from the browser at ordinary rates;
-    // above 30 fps the encoder needs a second one to drain the pipe in time.
+    // above 30 fps the encoder needs more workers to drain the pipe in time.
     cmd.args(["-pix_fmt", "yuv420p"])
-        .args(["-threads", if high_fps { "2" } else { "1" }])
+        .args([
+            "-threads",
+            if high_fps {
+                HIGH_FPS_ENCODER_THREADS
+            } else {
+                "1"
+            },
+        ])
         .arg(output_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -564,6 +584,7 @@ fn build_ffmpeg_command(output_path: &str, fps: u32, cursor: bool) -> tokio::pro
 
 #[derive(Debug)]
 struct ContactSheetFrame {
+    source: Arc<image::RgbImage>,
     image_data: Vec<u8>,
     elapsed_ms: u64,
     cursor: RecordingCursorState,
@@ -571,11 +592,22 @@ struct ContactSheetFrame {
     device_height: f64,
 }
 
+struct ContactSheetCell {
+    rendered: image::RgbaImage,
+    elapsed_ms: u64,
+}
+
+struct ContactSheetBaseline {
+    source: Arc<image::RgbImage>,
+    preview: image::RgbImage,
+}
+
 struct ContactSheetCollector {
     threshold: f64,
-    selected: Vec<ContactSheetFrame>,
-    previous_selected: Option<image::RgbImage>,
+    selected: Vec<ContactSheetCell>,
+    previous_selected: Option<ContactSheetBaseline>,
     latest: Option<ContactSheetFrame>,
+    cell_height: Option<u32>,
 }
 
 impl ContactSheetCollector {
@@ -585,6 +617,7 @@ impl ContactSheetCollector {
             selected: Vec::new(),
             previous_selected: None,
             latest: None,
+            cell_height: None,
         }
     }
 
@@ -596,109 +629,136 @@ impl ContactSheetCollector {
         device_width: f64,
         device_height: f64,
     ) {
-        let elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
-        self.latest = Some(ContactSheetFrame {
-            image_data: image_data.to_vec(),
-            elapsed_ms,
-            cursor,
-            device_width,
-            device_height,
-        });
-        if self.selected.len() >= MAX_CONTACT_SHEET_FRAMES {
+        // Encoded equality is only a shortcut; selection compares decoded pixels.
+        if let Some(latest) = self
+            .latest
+            .as_mut()
+            .filter(|frame| frame.image_data == image_data)
+        {
+            latest.elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+            latest.cursor = cursor;
+            latest.device_width = device_width;
+            latest.device_height = device_height;
             return;
         }
         let Ok(source) = image::load_from_memory(image_data) else {
             return;
         };
-        let source_width = source.width().max(1);
-        let source_height = source.height().max(1);
-        let diff_height = ((source_height as f64 * CONTACT_SHEET_DIFF_WIDTH as f64
-            / source_width as f64)
+        let preview_width = source.width().clamp(1, CONTACT_SHEET_DIFF_WIDTH);
+        let preview_height = ((source.height() as f64 * preview_width as f64
+            / source.width().max(1) as f64)
             .round() as u32)
             .max(1);
-        let thumbnail = source
-            .resize_exact(
-                CONTACT_SHEET_DIFF_WIDTH,
-                diff_height,
-                image::imageops::FilterType::Triangle,
-            )
-            .to_rgb8();
-
-        let selection = match self.previous_selected.as_ref() {
-            None => Some(()),
-            Some(previous) => {
-                let (ratio, _) = changed_pixel_regions(previous, &thumbnail);
-                (ratio > 0.0 && ratio >= self.threshold).then_some(())
-            }
+        // Integer averaging is sufficient for selection; preserve full pixels
+        // for region detection and the high-quality cell rendering below.
+        let preview = source
+            .thumbnail_exact(preview_width, preview_height)
+            .into_rgb8();
+        let source = Arc::new(source.into_rgb8());
+        let cell_height = *self.cell_height.get_or_insert_with(|| {
+            ((CONTACT_SHEET_CELL_WIDTH as f64 * source.height() as f64
+                / source.width().max(1) as f64)
+                .round() as u32)
+                .max(1)
+        });
+        let frame = ContactSheetFrame {
+            source,
+            image_data: image_data.to_vec(),
+            elapsed_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
+            cursor,
+            device_width,
+            device_height,
         };
-        if selection.is_some() {
-            self.previous_selected = Some(thumbnail);
-            self.selected.push(ContactSheetFrame {
-                image_data: image_data.to_vec(),
-                elapsed_ms,
-                cursor,
-                device_width,
-                device_height,
+        // Reserve one slot for the final frame. Compare with the last selected
+        // cell so small changes accumulate instead of disappearing.
+        let selected = self.selected.len() < MAX_CONTACT_SHEET_FRAMES - 1
+            && self.previous_selected.as_ref().is_none_or(|previous| {
+                if previous.source.dimensions() != frame.source.dimensions() {
+                    return true;
+                }
+                let ratio = changed_pixel_ratio(&previous.preview, &preview);
+                ratio > 0.0 && ratio >= self.threshold
+            });
+        if selected {
+            self.selected.push(render_contact_cell(
+                &frame,
+                self.previous_selected
+                    .as_ref()
+                    .map(|previous| previous.source.as_ref()),
+                cell_height,
+            ));
+            self.previous_selected = Some(ContactSheetBaseline {
+                source: frame.source.clone(),
+                preview,
             });
         }
+        self.latest = Some(frame);
     }
 
-    fn finish(mut self) -> Vec<ContactSheetFrame> {
+    fn finish(mut self) -> Vec<ContactSheetCell> {
         if let Some(latest) = self.latest {
             let already_selected = self
                 .selected
                 .last()
                 .is_some_and(|frame| frame.elapsed_ms == latest.elapsed_ms);
             if !already_selected {
-                if self.selected.len() >= MAX_CONTACT_SHEET_FRAMES {
-                    self.selected.pop();
-                }
-                self.selected.push(latest);
+                // Only the terminal candidate is finalized here; every selected
+                // cell has already been rendered while consuming the stream.
+                self.selected.push(render_contact_cell(
+                    &latest,
+                    self.previous_selected
+                        .as_ref()
+                        .map(|previous| previous.source.as_ref()),
+                    self.cell_height.unwrap_or(1),
+                ));
             }
         }
         self.selected
     }
 }
 
-/// Ratio and normalized bounds of visually changed tile clusters. Tile density
-/// suppresses isolated noise while preserving separate areas of page activity.
-fn changed_pixel_regions(
-    before: &image::RgbImage,
-    after: &image::RgbImage,
-) -> (f64, Vec<[f32; 4]>) {
+fn changed_pixel_ratio(before: &image::RgbImage, after: &image::RgbImage) -> f64 {
     if before.dimensions() != after.dimensions() {
-        return (1.0, vec![[0.0, 0.0, 1.0, 1.0]]);
+        return 1.0;
     }
     let (width, height) = after.dimensions();
     if width == 0 || height == 0 {
-        return (0.0, Vec::new());
+        return 0.0;
     }
-    let mut changed = 0u64;
+    let changed = before
+        .as_raw()
+        .chunks_exact(3)
+        .zip(after.as_raw().chunks_exact(3))
+        .filter(|(a, b)| a != b)
+        .count();
+    changed as f64 / (width as u64 * height as u64) as f64
+}
+
+/// Normalized bounds of visually changed tile clusters. This runs only for
+/// frames already selected as contact-sheet cells.
+fn changed_pixel_regions(before: &image::RgbImage, after: &image::RgbImage) -> Vec<[f32; 4]> {
+    if before.dimensions() != after.dimensions() {
+        return vec![[0.0, 0.0, 1.0, 1.0]];
+    }
+    let (width, height) = after.dimensions();
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
     let tiles_wide = width.div_ceil(CONTACT_SHEET_TILE_SIZE);
     let tiles_high = height.div_ceil(CONTACT_SHEET_TILE_SIZE);
     let mut tile_counts = vec![0u32; (tiles_wide * tiles_high) as usize];
-    for y in 0..height {
-        for x in 0..width {
-            let a = before.get_pixel(x, y).0;
-            let b = after.get_pixel(x, y).0;
-            let delta = a
-                .iter()
-                .zip(b.iter())
-                .map(|(left, right)| left.abs_diff(*right))
-                .max()
-                .unwrap_or(0);
-            if delta >= CONTACT_SHEET_PIXEL_DELTA {
-                changed += 1;
-                let tile_x = x / CONTACT_SHEET_TILE_SIZE;
-                let tile_y = y / CONTACT_SHEET_TILE_SIZE;
-                tile_counts[(tile_y * tiles_wide + tile_x) as usize] += 1;
-            }
+    for (index, (a, b)) in before
+        .as_raw()
+        .chunks_exact(3)
+        .zip(after.as_raw().chunks_exact(3))
+        .enumerate()
+    {
+        if a != b {
+            let tile_x = (index % width as usize) as u32 / CONTACT_SHEET_TILE_SIZE;
+            let tile_y = (index / width as usize) as u32 / CONTACT_SHEET_TILE_SIZE;
+            tile_counts[(tile_y * tiles_wide + tile_x) as usize] += 1;
         }
     }
-    if changed == 0 {
-        return (0.0, Vec::new());
-    }
-    let ratio = changed as f64 / (width as u64 * height as u64) as f64;
     let mut components: Vec<(u64, u32, u32, u32, u32)> = Vec::new();
     for start_y in 0..tiles_high {
         for start_x in 0..tiles_wide {
@@ -761,7 +821,7 @@ fn changed_pixel_regions(
         index += 1;
     }
     components.sort_by_key(|&(_, min_x, min_y, _, _)| (min_y, min_x));
-    let regions = components
+    components
         .into_iter()
         .map(|(_, min_tile_x, min_tile_y, max_tile_x, max_tile_y)| {
             let min_x = min_tile_x.saturating_sub(CONTACT_SHEET_REGION_PADDING_TILES)
@@ -781,8 +841,7 @@ fn changed_pixel_regions(
                 (max_y - min_y) as f32 / height as f32,
             ]
         })
-        .collect();
-    (ratio, regions)
+        .collect()
 }
 
 fn format_contact_timestamp(milliseconds: u64) -> String {
@@ -884,76 +943,79 @@ fn draw_changed_region(image: &mut image::RgbaImage, x: u32, y: u32, width: u32,
     }
 }
 
-fn write_contact_sheet(path: &Path, frames: &[ContactSheetFrame]) -> Result<(), String> {
-    let first = frames
-        .first()
-        .ok_or("No frames selected for contact sheet")?;
-    let first_image = image::load_from_memory(&first.image_data)
-        .map_err(|e| format!("Failed to decode contact sheet frame: {}", e))?;
-    let cell_height = ((CONTACT_SHEET_CELL_WIDTH as f64 * first_image.height() as f64
-        / first_image.width().max(1) as f64)
-        .round() as u32)
-        .max(1);
-    let columns = CONTACT_SHEET_COLUMNS.min(frames.len() as u32).max(1);
-    let rows = (frames.len() as u32).div_ceil(columns);
-    let canvas_width = CONTACT_SHEET_GAP + columns * (CONTACT_SHEET_CELL_WIDTH + CONTACT_SHEET_GAP);
-    let canvas_height =
-        CONTACT_SHEET_GAP + rows * (CONTACT_SHEET_LABEL_HEIGHT + cell_height + CONTACT_SHEET_GAP);
-    let mut canvas =
-        image::RgbaImage::from_pixel(canvas_width, canvas_height, image::Rgba([17, 24, 39, 255]));
-
-    let mut previous_source: Option<image::RgbImage> = None;
-    for (index, frame) in frames.iter().enumerate() {
-        let source = image::load_from_memory(&frame.image_data)
-            .map_err(|e| format!("Failed to decode contact sheet frame: {}", e))?;
-        let source_rgb = source.to_rgb8();
-        let changed_regions = previous_source
-            .as_ref()
-            .map(|previous| changed_pixel_regions(previous, &source_rgb).1)
-            .unwrap_or_default();
-        let mut display_rgb = source_rgb.clone();
-        let cursor = scale_cursor_dimensions(
+fn render_contact_cell(
+    frame: &ContactSheetFrame,
+    previous: Option<&image::RgbImage>,
+    cell_height: u32,
+) -> ContactSheetCell {
+    let source = frame.source.as_ref();
+    let regions = previous
+        .map(|before| changed_pixel_regions(before, source))
+        .unwrap_or_default();
+    let mut display = source.clone();
+    composite_cursor(
+        &mut display,
+        scale_cursor_dimensions(
             frame.cursor,
             frame.device_width,
             frame.device_height,
-            display_rgb.width(),
-            display_rgb.height(),
+            source.width(),
+            source.height(),
+        ),
+    );
+    let rendered = image::DynamicImage::ImageRgb8(display)
+        .resize(
+            CONTACT_SHEET_CELL_WIDTH,
+            cell_height,
+            image::imageops::FilterType::Triangle,
+        )
+        .to_rgba8();
+    let mut cell = image::RgbaImage::from_pixel(
+        CONTACT_SHEET_CELL_WIDTH,
+        cell_height + CONTACT_SHEET_LABEL_HEIGHT,
+        image::Rgba([17, 24, 39, 255]),
+    );
+    let x = (CONTACT_SHEET_CELL_WIDTH - rendered.width()) / 2;
+    copy_contact_cell(&mut cell, &rendered, x, CONTACT_SHEET_LABEL_HEIGHT);
+    draw_timestamp(&mut cell, 4, 4, &format_contact_timestamp(frame.elapsed_ms));
+    for [rx, ry, rw, rh] in regions {
+        draw_changed_region(
+            &mut cell,
+            x + (rx * rendered.width() as f32).round() as u32,
+            CONTACT_SHEET_LABEL_HEIGHT + (ry * rendered.height() as f32).round() as u32,
+            (rw * rendered.width() as f32).round().max(1.0) as u32,
+            (rh * rendered.height() as f32).round().max(1.0) as u32,
         );
-        composite_cursor(&mut display_rgb, cursor);
-        let rendered = image::DynamicImage::ImageRgb8(display_rgb)
-            .resize(
-                CONTACT_SHEET_CELL_WIDTH,
-                cell_height,
-                image::imageops::FilterType::Triangle,
-            )
-            .to_rgba8();
-        let column = index as u32 % columns;
-        let row = index as u32 / columns;
-        let cell_x = CONTACT_SHEET_GAP + column * (CONTACT_SHEET_CELL_WIDTH + CONTACT_SHEET_GAP);
-        let label_y = CONTACT_SHEET_GAP
-            + row * (CONTACT_SHEET_LABEL_HEIGHT + cell_height + CONTACT_SHEET_GAP);
-        let image_y = label_y + CONTACT_SHEET_LABEL_HEIGHT;
-        let image_x = cell_x + (CONTACT_SHEET_CELL_WIDTH - rendered.width()) / 2;
-        image::imageops::overlay(&mut canvas, &rendered, image_x.into(), image_y.into());
-        draw_timestamp(
-            &mut canvas,
-            cell_x + 4,
-            label_y + 4,
-            &format_contact_timestamp(frame.elapsed_ms),
-        );
-
-        for [rx, ry, rw, rh] in &changed_regions {
-            draw_changed_region(
-                &mut canvas,
-                image_x + (rx * rendered.width() as f32).round() as u32,
-                image_y + (ry * rendered.height() as f32).round() as u32,
-                (rw * rendered.width() as f32).round().max(1.0) as u32,
-                (rh * rendered.height() as f32).round().max(1.0) as u32,
-            );
-        }
-        previous_source = Some(source_rgb);
     }
+    ContactSheetCell {
+        rendered: cell,
+        elapsed_ms: frame.elapsed_ms,
+    }
+}
 
+/// Assemble cells whose image analysis and rendering are already complete.
+fn write_contact_sheet(path: &Path, frames: &[ContactSheetCell]) -> Result<(), String> {
+    let first = frames
+        .first()
+        .map(|frame| &frame.rendered)
+        .ok_or("No frames rendered for contact sheet")?;
+    let columns = CONTACT_SHEET_COLUMNS.min(frames.len() as u32).max(1);
+    let rows = (frames.len() as u32).div_ceil(columns);
+    let width = CONTACT_SHEET_GAP + columns * (CONTACT_SHEET_CELL_WIDTH + CONTACT_SHEET_GAP);
+    let height = CONTACT_SHEET_GAP + rows * (first.height() + CONTACT_SHEET_GAP);
+    let mut canvas = image::RgbaImage::from_raw(
+        width,
+        height,
+        [17, 24, 39, 255].repeat(width as usize * height as usize),
+    )
+    .expect("sheet dimensions");
+    for (index, frame) in frames.iter().enumerate() {
+        let cell = &frame.rendered;
+        let x = CONTACT_SHEET_GAP
+            + index as u32 % columns * (CONTACT_SHEET_CELL_WIDTH + CONTACT_SHEET_GAP);
+        let y = CONTACT_SHEET_GAP + index as u32 / columns * (first.height() + CONTACT_SHEET_GAP);
+        copy_contact_cell(&mut canvas, cell, x, y);
+    }
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -964,6 +1026,16 @@ fn write_contact_sheet(path: &Path, frames: &[ContactSheetFrame]) -> Result<(), 
     canvas
         .save(path)
         .map_err(|e| format!("Failed to save contact sheet: {}", e))
+}
+
+/// Contact-sheet images are opaque and fully inside the canvas; no blending is needed.
+fn copy_contact_cell(canvas: &mut image::RgbaImage, cell: &image::RgbaImage, x: u32, y: u32) {
+    let stride = canvas.width() as usize * 4;
+    let row_bytes = cell.width() as usize * 4;
+    for (row, pixels) in cell.as_raw().chunks_exact(row_bytes).enumerate() {
+        let offset = (y as usize + row) * stride + x as usize * 4;
+        canvas.as_mut()[offset..offset + row_bytes].copy_from_slice(pixels);
+    }
 }
 
 /// Attach the recorder's own flattened session to the target behind
@@ -1020,22 +1092,18 @@ pub async fn attach_capture_session(
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct CapturedVideoFrame {
-    path: std::path::PathBuf,
+    sequence: u64,
+    image_data: Arc<Vec<u8>>,
     elapsed: Duration,
+    captured_at: tokio::time::Instant,
     timestamp: f64,
     device_width: f64,
     device_height: f64,
 }
 
-#[derive(Debug)]
-struct CapturedRecording {
-    frames: Vec<CapturedVideoFrame>,
-    duration: Duration,
-}
-
-/// Capture clean PNG frames, then build the video and contact sheet separately.
+/// Drain Chrome independently from the encoder so FFmpeg cannot stall frame ACKs.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_recording_task(
     client: Arc<CdpClient>,
@@ -1054,8 +1122,31 @@ pub fn spawn_recording_task(
     tokio::spawn(async move {
         let fps = validate_fps(fps)?;
         let events = client.subscribe_session(&capture_session);
-        let capture_dir = tempfile::tempdir()
-            .map_err(|e| format!("Failed to create recording frame directory: {}", e))?;
+        let (frame_tx, frame_rx) = mpsc::channel(ENCODER_FRAME_BUFFER);
+        let (contact_tx, mut contact_worker) = if let Some(path) = contact_sheet_path.as_ref() {
+            let (tx, rx) = std::sync::mpsc::sync_channel(ENCODER_FRAME_BUFFER);
+            let contact_cursor = shared_cursor.clone();
+            let path = path.clone();
+            let worker = tokio::task::spawn_blocking(move || {
+                let frames =
+                    collect_contact_frames(rx, contact_sheet_threshold, cursor, &contact_cursor)?;
+                write_contact_sheet(Path::new(&path), &frames)?;
+                Ok::<u64, String>(frames.len() as u64)
+            });
+            (Some(tx), Some(worker))
+        } else {
+            if std::env::var_os("AGENT_BROWSER_DEBUG").is_some() {
+                eprintln!("[contact-sheet] disabled; no worker or queue");
+            }
+            (None, None)
+        };
+        let encoder = tokio::spawn(encode_stream(
+            output_path,
+            fps,
+            cursor,
+            shared_cursor.clone(),
+            frame_rx,
+        ));
 
         let started = client
             .send_command(
@@ -1071,13 +1162,14 @@ pub fn spawn_recording_task(
             )
             .await;
 
-        let capture = match started {
+        let captured = match started {
             Ok(_) => {
                 collect_frames(
                     &client,
                     &capture_session,
                     events,
-                    capture_dir.path(),
+                    frame_tx,
+                    contact_tx,
                     &shared_captured,
                     cancel_rx,
                 )
@@ -1104,20 +1196,43 @@ pub fn spawn_recording_task(
         )
         .await;
 
-        let capture = capture?;
-        let history = shared_cursor
-            .lock()
-            .map(|value| value.clone())
-            .unwrap_or_default();
-        let written = encode_capture(&capture, &output_path, fps, cursor, &history).await?;
-        shared_count.store(written, Ordering::Relaxed);
-
-        if let Some(path) = contact_sheet_path {
-            let contact_frames =
-                select_contact_frames(&capture.frames, contact_sheet_threshold, cursor, &history)?;
-            write_contact_sheet(Path::new(&path), &contact_frames)?;
-            shared_contact_sheet_count.store(contact_frames.len() as u64, Ordering::Relaxed);
+        if let Err(error) = captured {
+            if error == "Recording encoder stopped unexpectedly" {
+                return match encoder.await {
+                    Ok(Err(encoder_error)) => Err(encoder_error),
+                    Ok(Ok(_)) => Err(error),
+                    Err(join_error) => {
+                        Err(format!("Recording encoder task failed: {}", join_error))
+                    }
+                };
+            }
+            encoder.abort();
+            let _ = encoder.await;
+            if error == "Contact sheet analyzer stopped unexpectedly" {
+                return match contact_worker.take() {
+                    Some(worker) => match worker.await {
+                        Ok(Err(contact_error)) => Err(contact_error),
+                        Ok(Ok(_)) => Err(error),
+                        Err(join_error) => {
+                            Err(format!("Contact sheet task failed: {}", join_error))
+                        }
+                    },
+                    None => Err(error),
+                };
+            }
+            return Err(error);
         }
+        let streamed = encoder
+            .await
+            .map_err(|e| format!("Recording encoder task failed: {}", e))??;
+        shared_count.store(streamed, Ordering::Relaxed);
+        let contact_sheet_count = match contact_worker {
+            Some(worker) => worker
+                .await
+                .map_err(|e| format!("Contact sheet task failed: {}", e))??,
+            None => 0,
+        };
+        shared_contact_sheet_count.store(contact_sheet_count, Ordering::Relaxed);
 
         Ok(())
     })
@@ -1127,13 +1242,14 @@ async fn collect_frames(
     client: &CdpClient,
     capture_session: &str,
     mut events: mpsc::Receiver<super::cdp::types::CdpEvent>,
-    directory: &Path,
+    frame_tx: mpsc::Sender<CapturedVideoFrame>,
+    contact_tx: Option<std::sync::mpsc::SyncSender<CapturedVideoFrame>>,
     shared_captured: &AtomicU64,
     cancel_rx: oneshot::Receiver<()>,
-) -> Result<CapturedRecording, String> {
+) -> Result<(), String> {
     let mut cancel_rx = std::pin::pin!(cancel_rx);
     let started = tokio::time::Instant::now();
-    let mut frames = Vec::new();
+    let mut sequence = 0u64;
 
     loop {
         tokio::select! {
@@ -1159,19 +1275,42 @@ async fn collect_frames(
                                 .ok()
                         });
                     if let Some(bytes) = decoded {
-                        let index = frames.len();
-                        let path = directory.join(format!("frame-{index:08}.png"));
-                        tokio::fs::write(&path, bytes).await
-                            .map_err(|e| format!("Failed to spool recording frame: {}", e))?;
                         let metadata = &event.params["metadata"];
-                        frames.push(CapturedVideoFrame {
-                            path,
-                            elapsed: started.elapsed(),
-                            timestamp: metadata["timestamp"].as_f64().unwrap_or_else(cursor_timestamp),
+                        let elapsed = started.elapsed();
+                        let timestamp = metadata["timestamp"]
+                            .as_f64()
+                            .unwrap_or_else(cursor_timestamp);
+                        let frame = CapturedVideoFrame {
+                            sequence,
+                            image_data: Arc::new(bytes),
+                            elapsed,
+                            captured_at: tokio::time::Instant::now(),
+                            timestamp,
                             device_width: metadata["deviceWidth"].as_f64().unwrap_or(0.0),
                             device_height: metadata["deviceHeight"].as_f64().unwrap_or(0.0),
-                        });
+                        };
+                        sequence += 1;
                         shared_captured.fetch_add(1, Ordering::Relaxed);
+                        frame_tx.try_send(frame.clone()).map_err(|error| match error {
+                            mpsc::error::TrySendError::Full(_) => format!(
+                                "Recording encoder fell behind by more than {} buffered frames",
+                                ENCODER_FRAME_BUFFER
+                            ),
+                            mpsc::error::TrySendError::Closed(_) => {
+                                "Recording encoder stopped unexpectedly".to_string()
+                            }
+                        })?;
+                        if let Some(contact_tx) = contact_tx.as_ref() {
+                            contact_tx.try_send(frame).map_err(|error| match error {
+                                std::sync::mpsc::TrySendError::Full(_) => format!(
+                                    "Contact sheet analyzer fell behind by more than {} buffered frames",
+                                    ENCODER_FRAME_BUFFER
+                                ),
+                                std::sync::mpsc::TrySendError::Disconnected(_) => {
+                                    "Contact sheet analyzer stopped unexpectedly".to_string()
+                                }
+                            })?;
+                        }
                     }
                 } else if event.method == "Inspector.detached" {
                     // The recorded page was closed; finish the file.
@@ -1180,40 +1319,202 @@ async fn collect_frames(
             }
         }
     }
-
-    if frames.is_empty() {
-        return Err("No frames captured".to_string());
-    }
-    Ok(CapturedRecording {
-        frames,
-        duration: started.elapsed(),
-    })
+    Ok(())
 }
 
-fn select_contact_frames(
-    frames: &[CapturedVideoFrame],
+/// Analyze and render each candidate as it arrives on the blocking worker.
+fn collect_contact_frames(
+    frames: std::sync::mpsc::Receiver<CapturedVideoFrame>,
     threshold: f64,
     cursor: bool,
-    history: &RecordingCursorHistory,
-) -> Result<Vec<ContactSheetFrame>, String> {
+    shared_cursor: &SharedRecordingCursor,
+) -> Result<Vec<ContactSheetCell>, String> {
     let mut collector = ContactSheetCollector::new(threshold);
+    let mut max_lag = Duration::ZERO;
+    let mut processed = 0u64;
     for frame in frames {
-        let clean = std::fs::read(&frame.path)
-            .map_err(|e| format!("Failed to read contact sheet frame: {}", e))?;
         let cursor_state = if cursor {
-            history.at(frame.timestamp)
+            shared_cursor
+                .lock()
+                .map(|history| history.at(frame.timestamp))
+                .unwrap_or_default()
         } else {
             RecordingCursorState::default()
         };
         collector.consider(
-            &clean,
+            &frame.image_data,
             frame.elapsed,
             cursor_state,
             frame.device_width,
             frame.device_height,
         );
+        // Measure through completed selection/rendering, not just dequeue.
+        let lag = frame.captured_at.elapsed();
+        max_lag = max_lag.max(lag);
+        processed += 1;
+        if lag > MAX_ENCODER_LAG {
+            return Err("Contact sheet analysis fell more than 500 ms behind capture".to_string());
+        }
+    }
+    if std::env::var_os("AGENT_BROWSER_DEBUG").is_some() {
+        eprintln!(
+            "[contact-sheet] processed={} max_analysis_lag_ms={:.3} rendered_cells={}",
+            processed,
+            max_lag.as_secs_f64() * 1000.0,
+            collector.selected.len()
+        );
     }
     Ok(collector.finish())
+}
+
+async fn write_encoder_bytes(
+    stdin: &mut tokio::process::ChildStdin,
+    bytes: &[u8],
+) -> Result<(), String> {
+    tokio::time::timeout(ENCODER_WRITE_TIMEOUT, stdin.write_all(bytes))
+        .await
+        .map_err(|_| "Recording encoder pipe was blocked for more than 2 seconds".to_string())?
+        .map_err(|e| format!("ffmpeg write failed: {}", e))
+}
+
+fn render_cursor_frame(
+    frame: &CapturedVideoFrame,
+    history: &RecordingCursorHistory,
+    output_timestamp: f64,
+    decoded: &mut Option<(u64, image::RgbImage)>,
+) -> Result<Vec<u8>, String> {
+    if decoded.as_ref().is_none_or(|(id, _)| *id != frame.sequence) {
+        let image = image::load_from_memory(&frame.image_data)
+            .map_err(|e| format!("Failed to decode recording frame: {}", e))?
+            .to_rgb8();
+        *decoded = Some((frame.sequence, image));
+    }
+    let source = &decoded.as_ref().expect("decoded frame exists").1;
+    let state = scaled_cursor(
+        cursor_for_video_frame(history, frame, output_timestamp),
+        frame,
+        source.width(),
+        source.height(),
+    );
+    let mut rendered = source.clone();
+    for (started, click) in history.click_starts().into_iter().filter(|(started, _)| {
+        output_timestamp >= *started && output_timestamp - *started < RIPPLE_DURATION_SECS
+    }) {
+        let click = scaled_cursor(click, frame, source.width(), source.height());
+        composite_ripple(
+            &mut rendered,
+            click.x,
+            click.y,
+            (output_timestamp - started) / RIPPLE_DURATION_SECS,
+        );
+    }
+    composite_cursor(&mut rendered, state);
+    let mut bytes = format!("P6\n{} {}\n255\n", rendered.width(), rendered.height()).into_bytes();
+    bytes.extend_from_slice(rendered.as_raw());
+    Ok(bytes)
+}
+
+async fn encode_stream(
+    output_path: String,
+    fps: u32,
+    cursor: bool,
+    shared_cursor: SharedRecordingCursor,
+    mut frames: mpsc::Receiver<CapturedVideoFrame>,
+) -> Result<u64, String> {
+    let mut command = build_ffmpeg_command(&output_path, fps, cursor);
+    let mut ffmpeg = command.spawn().map_err(|e| {
+        format!(
+            "ffmpeg not found or failed to execute: {}. Install ffmpeg to enable recording.",
+            e
+        )
+    })?;
+    let mut stdin = ffmpeg
+        .stdin
+        .take()
+        .ok_or_else(|| "Failed to open ffmpeg stdin".to_string())?;
+    let mut interval = tokio::time::interval(frame_period(fps));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut latest: Option<CapturedVideoFrame> = None;
+    let mut decoded = None;
+    let mut last_page: Option<Arc<Vec<u8>>> = None;
+    let mut last_cursor = None;
+    let mut written = 0u64;
+
+    loop {
+        tokio::select! {
+            frame = frames.recv() => {
+                let Some(frame) = frame else { break };
+                if frame.captured_at.elapsed() > MAX_ENCODER_LAG {
+                    return Err("Recording encoder fell more than 500 ms behind capture".to_string());
+                }
+                latest = Some(frame);
+            }
+            _ = interval.tick() => {
+                let Some(frame) = latest.as_ref() else { continue };
+                let output_timestamp = cursor_timestamp();
+                let history = shared_cursor
+                    .lock()
+                    .map(|history| history.clone())
+                    .unwrap_or_default();
+                let (cursor_state, ripple_active) = if cursor {
+                    let state = cursor_for_video_frame(&history, frame, output_timestamp);
+                    let ripple = history.click_starts().into_iter().any(|(started, _)| {
+                        output_timestamp >= started
+                            && output_timestamp - started < RIPPLE_DURATION_SECS
+                    });
+                    (Some(state), ripple)
+                } else {
+                    (None, false)
+                };
+                let page_changed = last_page
+                    .as_deref()
+                    .is_none_or(|previous| previous != frame.image_data.as_slice());
+                if !page_changed && cursor_state == last_cursor && !ripple_active {
+                    continue;
+                }
+                if cursor {
+                    let bytes =
+                        render_cursor_frame(frame, &history, output_timestamp, &mut decoded)?;
+                    write_encoder_bytes(&mut stdin, &bytes).await?;
+                    last_cursor = cursor_state;
+                } else {
+                    write_encoder_bytes(&mut stdin, &frame.image_data).await?;
+                }
+                last_page = Some(frame.image_data.clone());
+                written += 1;
+            }
+        }
+    }
+
+    let Some(frame) = latest.as_ref() else {
+        return Err("No frames captured".to_string());
+    };
+    let output_timestamp = cursor_timestamp();
+    if cursor {
+        let history = shared_cursor
+            .lock()
+            .map(|history| history.clone())
+            .unwrap_or_default();
+        let bytes = render_cursor_frame(frame, &history, output_timestamp, &mut decoded)?;
+        write_encoder_bytes(&mut stdin, &bytes).await?;
+    } else {
+        write_encoder_bytes(&mut stdin, &frame.image_data).await?;
+    }
+    written += 1;
+    drop(stdin);
+
+    let output = ffmpeg
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("ffmpeg wait failed: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "ffmpeg failed: {}",
+            stderr.chars().take(300).collect::<String>()
+        ));
+    }
+    Ok(written)
 }
 
 fn scale_cursor_dimensions(
@@ -1259,115 +1560,6 @@ fn cursor_for_video_frame(
     } else {
         animated
     }
-}
-
-async fn encode_capture(
-    capture: &CapturedRecording,
-    output_path: &str,
-    fps: u32,
-    cursor: bool,
-    history: &RecordingCursorHistory,
-) -> Result<u64, String> {
-    let mut command = build_ffmpeg_command(output_path, fps, cursor);
-    let mut ffmpeg = command.spawn().map_err(|e| {
-        format!(
-            "ffmpeg not found or failed to execute: {}. Install ffmpeg to enable recording.",
-            e
-        )
-    })?;
-    let mut stdin = ffmpeg
-        .stdin
-        .take()
-        .ok_or_else(|| "Failed to open ffmpeg stdin".to_string())?;
-    let total = (capture.duration.as_secs_f64() * fps as f64)
-        .ceil()
-        .max(1.0) as u64;
-    let timeline_origin = capture.frames[0].timestamp - capture.frames[0].elapsed.as_secs_f64();
-    let mut page_index = 0usize;
-    let mut loaded_index = usize::MAX;
-    let mut clean_bytes = Vec::new();
-    let mut clean_rgb: Option<image::RgbImage> = None;
-    let click_starts = history.click_starts();
-    let mut next_click = 0usize;
-    let mut active_clicks = VecDeque::new();
-
-    for slot in 0..total {
-        let elapsed = Duration::from_secs_f64(slot as f64 / fps as f64);
-        let output_timestamp = timeline_origin + elapsed.as_secs_f64();
-        while page_index + 1 < capture.frames.len()
-            && capture.frames[page_index + 1].elapsed <= elapsed
-        {
-            page_index += 1;
-        }
-        let page_frame = &capture.frames[page_index];
-        if loaded_index != page_index {
-            clean_bytes = std::fs::read(&page_frame.path)
-                .map_err(|e| format!("Failed to read recording frame: {}", e))?;
-            clean_rgb = cursor
-                .then(|| {
-                    image::load_from_memory(&clean_bytes)
-                        .map(|image| image.to_rgb8())
-                        .map_err(|e| format!("Failed to decode recording frame: {}", e))
-                })
-                .transpose()?;
-            loaded_index = page_index;
-        }
-
-        if let Some(source) = clean_rgb.as_ref() {
-            let state = cursor_for_video_frame(history, page_frame, output_timestamp);
-            let state = scaled_cursor(state, page_frame, source.width(), source.height());
-            let mut rendered = source.clone();
-            while next_click < click_starts.len() && click_starts[next_click].0 <= output_timestamp
-            {
-                active_clicks.push_back(click_starts[next_click]);
-                next_click += 1;
-            }
-            while active_clicks
-                .front()
-                .is_some_and(|(started, _)| output_timestamp - started >= RIPPLE_DURATION_SECS)
-            {
-                active_clicks.pop_front();
-            }
-            for &(started, click) in &active_clicks {
-                let click = scaled_cursor(click, page_frame, source.width(), source.height());
-                composite_ripple(
-                    &mut rendered,
-                    click.x,
-                    click.y,
-                    (output_timestamp - started) / RIPPLE_DURATION_SECS,
-                );
-            }
-            composite_cursor(&mut rendered, state);
-            let header = format!("P6\n{} {}\n255\n", rendered.width(), rendered.height());
-            stdin
-                .write_all(header.as_bytes())
-                .await
-                .map_err(|e| format!("ffmpeg write failed: {}", e))?;
-            stdin
-                .write_all(rendered.as_raw())
-                .await
-                .map_err(|e| format!("ffmpeg write failed: {}", e))?;
-        } else {
-            stdin
-                .write_all(&clean_bytes)
-                .await
-                .map_err(|e| format!("ffmpeg write failed: {}", e))?;
-        }
-    }
-    drop(stdin);
-
-    let output = ffmpeg
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("ffmpeg wait failed: {}", e))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "ffmpeg failed: {}",
-            stderr.chars().take(300).collect::<String>()
-        ));
-    }
-    Ok(total)
 }
 
 pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), String> {
@@ -1504,8 +1696,10 @@ mod tests {
         history.record_at(13.0, 310.0, 320.0, 0);
         history.record_at(14.0, 410.0, 420.0, 0);
         let frame = CapturedVideoFrame {
-            path: std::path::PathBuf::new(),
+            sequence: 0,
+            image_data: Arc::new(Vec::new()),
             elapsed: Duration::ZERO,
+            captured_at: tokio::time::Instant::now(),
             timestamp: 11.0,
             device_width: 1000.0,
             device_height: 500.0,
@@ -1525,8 +1719,10 @@ mod tests {
     #[test]
     fn test_cursor_scales_from_page_to_screencast_pixels() {
         let frame = CapturedVideoFrame {
-            path: std::path::PathBuf::new(),
+            sequence: 0,
+            image_data: Arc::new(Vec::new()),
             elapsed: Duration::ZERO,
+            captured_at: tokio::time::Instant::now(),
             timestamp: 0.0,
             device_width: 640.0,
             device_height: 360.0,
@@ -1553,27 +1749,35 @@ mod tests {
         let clean = image::RgbImage::from_pixel(80, 80, image::Rgb([240, 240, 240]));
         clean.save(&path).unwrap();
         let original = std::fs::read(&path).unwrap();
-        let captured: Vec<_> = (0..3)
-            .map(|index| CapturedVideoFrame {
-                path: path.clone(),
-                elapsed: Duration::from_secs(index),
-                timestamp: index as f64 + 1.0,
-                device_width: 80.0,
-                device_height: 80.0,
-            })
-            .collect();
         let mut history = RecordingCursorHistory::default();
         history.record_at(0.5, 10.0, 20.0, 0);
         history.record_at(1.5, 20.0, 30.0, 0);
         history.record_at(2.5, 30.0, 40.0, 0);
 
-        let selected = select_contact_frames(&captured, 0.05, true, &history).unwrap();
+        let mut collector = ContactSheetCollector::new(0.05);
+        for index in 0..3 {
+            let timestamp = index as f64 + 1.0;
+            collector.consider(
+                &original,
+                Duration::from_secs(index),
+                history.at(timestamp),
+                80.0,
+                80.0,
+            );
+        }
+        assert_eq!(
+            collector
+                .previous_selected
+                .as_ref()
+                .map(|previous| previous.source.as_ref()),
+            Some(&clean)
+        );
+        assert_eq!(collector.latest.as_ref().unwrap().image_data, original);
+        assert_eq!(collector.latest.as_ref().unwrap().cursor.x, 30.0);
+        let selected = collector.finish();
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].elapsed_ms, 0);
         assert_eq!(selected[1].elapsed_ms, 2000);
-        assert_eq!(selected[0].image_data, original);
-        assert_eq!(selected[0].cursor.x, 10.0);
-        assert_eq!(selected[1].cursor.x, 30.0);
 
         write_contact_sheet(&sheet_path, &selected).unwrap();
         let sheet = image::open(sheet_path).unwrap().to_rgb8();
@@ -1665,6 +1869,8 @@ mod tests {
     fn test_recording_state_new() {
         let state = RecordingState::new();
         assert!(!state.active);
+        assert!(!state.contact_sheet);
+        assert!(!RecordingOptions::default().contact_sheet);
         assert!(state.output_path.is_empty());
         assert_eq!(state.frame_count, 0);
         assert_eq!(state.fps, DEFAULT_FPS);
@@ -1746,7 +1952,8 @@ mod tests {
                 after.put_pixel(x, y, image::Rgb([255, 255, 255]));
             }
         }
-        let (ratio, regions) = changed_pixel_regions(&before, &after);
+        let ratio = changed_pixel_ratio(&before, &after);
+        let regions = changed_pixel_regions(&before, &after);
         assert!((ratio - 0.03125).abs() < f64::EPSILON);
         assert_eq!(
             regions,
@@ -1771,7 +1978,7 @@ mod tests {
                 }
             }
         }
-        let (_, regions) = changed_pixel_regions(&before, &after);
+        let regions = changed_pixel_regions(&before, &after);
         assert_eq!(regions.len(), 13, "flyout rows should form one region");
         for (x, y) in changed_points {
             assert!(
@@ -1786,26 +1993,166 @@ mod tests {
     }
 
     #[test]
-    fn test_contact_sheet_finish_includes_latest_frame() {
-        let mut collector = ContactSheetCollector::new(0.05);
-        collector.selected.push(ContactSheetFrame {
-            image_data: vec![1],
-            elapsed_ms: 10,
-            cursor: RecordingCursorState::default(),
-            device_width: 0.0,
-            device_height: 0.0,
-        });
-        collector.latest = Some(ContactSheetFrame {
-            image_data: vec![2],
-            elapsed_ms: 20,
-            cursor: RecordingCursorState::default(),
-            device_width: 0.0,
-            device_height: 0.0,
-        });
+    fn test_contact_sheet_selects_subtle_loading_panel_and_its_return() {
+        let mut collector = ContactSheetCollector::new(DEFAULT_CONTACT_SHEET_THRESHOLD);
+        for (elapsed, color) in [
+            (0, [226, 232, 240]),
+            (120, [219, 234, 254]),
+            (240, [226, 232, 240]),
+        ] {
+            let mut png = Vec::new();
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                640,
+                360,
+                image::Rgb(color),
+            ))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+            collector.consider(
+                &png,
+                Duration::from_millis(elapsed),
+                RecordingCursorState::default(),
+                640.0,
+                360.0,
+            );
+        }
+        assert_eq!(
+            collector.selected.len(),
+            3,
+            "subtle loading transitions must be selected before shutdown"
+        );
+        assert_eq!(collector.finish().len(), 3);
+    }
 
+    #[test]
+    fn test_contact_sheet_row_copy_matches_opaque_overlay() {
+        let mut actual = image::RgbaImage::from_pixel(23, 19, image::Rgba([17, 24, 39, 255]));
+        let mut expected = actual.clone();
+        let cell = image::RgbaImage::from_fn(13, 7, |x, y| {
+            image::Rgba([x as u8 * 13, y as u8 * 19, 80, 255])
+        });
+        image::imageops::overlay(&mut expected, &cell, 5, 9);
+        copy_contact_cell(&mut actual, &cell, 5, 9);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_contact_sheet_preview_preserves_thin_changes_between_sample_points() {
+        let mut collector = ContactSheetCollector::new(0.002);
+        let mut source = image::RgbImage::new(1280, 720);
+        for elapsed in [0, 10] {
+            if elapsed != 0 {
+                // Nearest-neighbor sampling at every fourth x would miss this.
+                for y in 0..720 {
+                    source.put_pixel(1, y, image::Rgb([255; 3]));
+                }
+            }
+            let mut png = Vec::new();
+            image::DynamicImage::ImageRgb8(source.clone())
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .unwrap();
+            collector.consider(
+                &png,
+                Duration::from_millis(elapsed),
+                RecordingCursorState::default(),
+                1280.0,
+                720.0,
+            );
+        }
+        assert_eq!(collector.selected.len(), 2);
+        assert_eq!(collector.finish().len(), 2);
+    }
+
+    #[test]
+    fn test_contact_sheet_streams_cells_and_preserves_accumulated_changes_and_flashes() {
+        let mut collector = ContactSheetCollector::new(0.10);
+        let base = image::RgbImage::new(100, 100);
+        let mut send = |source: image::RgbImage, elapsed| {
+            let mut png = Vec::new();
+            image::DynamicImage::ImageRgb8(source)
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .unwrap();
+            collector.consider(
+                &png,
+                Duration::from_millis(elapsed),
+                RecordingCursorState::default(),
+                100.0,
+                100.0,
+            );
+        };
+        send(base.clone(), 0);
+        let mut changed = base.clone();
+        for y in 0..5 {
+            for x in 0..100 {
+                changed.put_pixel(x, y, image::Rgb([255; 3]));
+            }
+        }
+        send(changed.clone(), 10);
+        for y in 5..12 {
+            for x in 0..100 {
+                changed.put_pixel(x, y, image::Rgb([255; 3]));
+            }
+        }
+        send(changed, 20);
+        // A one-frame flash must be selected, including its return to baseline.
+        send(
+            image::RgbImage::from_pixel(100, 100, image::Rgb([255; 3])),
+            30,
+        );
+        send(base, 40);
+        assert_eq!(
+            collector
+                .selected
+                .iter()
+                .map(|frame| frame.elapsed_ms)
+                .collect::<Vec<_>>(),
+            vec![0, 20, 30, 40]
+        );
+        assert!(
+            collector
+                .selected
+                .iter()
+                .all(|frame| frame.rendered.width() == CONTACT_SHEET_CELL_WIDTH),
+            "selected cells must be rendered before shutdown"
+        );
+        assert_eq!(collector.finish().len(), 4);
+    }
+
+    #[test]
+    fn test_contact_sheet_exact_duplicate_advances_final_frame_without_reselection() {
+        let mut collector = ContactSheetCollector::new(0.05);
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(100, 50))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        collector.consider(
+            &png,
+            Duration::from_millis(10),
+            RecordingCursorState::default(),
+            100.0,
+            50.0,
+        );
+        collector.consider(
+            &png,
+            Duration::from_millis(900),
+            RecordingCursorState {
+                x: 40.0,
+                y: 20.0,
+                buttons: 0,
+                visible: true,
+            },
+            100.0,
+            50.0,
+        );
+
+        assert_eq!(collector.latest.as_ref().unwrap().cursor.x, 40.0);
+        assert_eq!(collector.latest.as_ref().unwrap().image_data, png);
         let frames = collector.finish();
         assert_eq!(frames.len(), 2);
-        assert_eq!(frames.last().unwrap().image_data, vec![2]);
+        assert_eq!(frames[1].elapsed_ms, 900);
+        assert!(frames
+            .iter()
+            .all(|frame| frame.rendered.width() == CONTACT_SHEET_CELL_WIDTH));
     }
 
     #[test]
@@ -1894,6 +2241,13 @@ mod tests {
     }
 
     #[test]
+    fn test_frame_period_matches_requested_rate() {
+        assert_eq!(frame_period(1), Duration::from_secs(1));
+        assert_eq!(frame_period(30), Duration::from_micros(33_333));
+        assert_eq!(frame_period(60), Duration::from_micros(16_666));
+    }
+
+    #[test]
     fn test_build_ffmpeg_command_webm() {
         let cmd = build_ffmpeg_command("/tmp/out.webm", DEFAULT_FPS, false);
         let args: Vec<&std::ffi::OsStr> = cmd.as_std().get_args().collect();
@@ -1903,6 +2257,8 @@ mod tests {
         assert!(args_str.contains(&"8000k"));
         assert!(args_str.contains(&"18"));
         assert!(args_str.contains(&"png"));
+        assert!(args_str.contains(&"-use_wallclock_as_timestamps"));
+        assert!(args_str.contains(&"vfr"));
     }
 
     #[test]
@@ -1934,7 +2290,8 @@ mod tests {
             .position(|a| a == "-threads")
             .and_then(|i| args.get(i + 1))
             .map(String::as_str);
-        assert_eq!(threads, Some("2"));
+        assert_eq!(threads, Some(HIGH_FPS_ENCODER_THREADS));
+        assert!(args.iter().any(|a| a == "realtime"));
     }
 
     #[test]

@@ -5246,7 +5246,8 @@ fn changed_pixel_ratio(
     changed as f64 / (rgba.len() / 4) as f64
 }
 
-/// Compares decoded pixels with the preceding capture for the same tab and scope.
+/// Compares decoded pixels with the last returned conditional screenshot.
+/// Suppressed captures retain that baseline so small changes can accumulate.
 /// Encoded image metadata therefore cannot create a false positive.
 fn observe_screenshot(
     state: &mut DaemonState,
@@ -5278,17 +5279,21 @@ fn observe_screenshot(
         || previous.is_some_and(|item| item.signature != signature)
         || pixel_change_ratio > threshold;
 
-    state.screenshot_observations.insert(
-        key,
-        ScreenshotObservation {
-            revision,
-            signature,
-            decoded_hash,
-            width,
-            height,
-            rgba,
-        },
-    );
+    if changed {
+        state.screenshot_observations.insert(
+            key,
+            ScreenshotObservation {
+                revision,
+                signature,
+                decoded_hash,
+                width,
+                height,
+                rgba,
+            },
+        );
+    } else if let Some(previous) = state.screenshot_observations.get_mut(&key) {
+        previous.revision = revision;
+    }
     Ok(json!({
         "changed": changed,
         "revision": revision,

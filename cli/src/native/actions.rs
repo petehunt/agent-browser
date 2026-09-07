@@ -12319,7 +12319,8 @@ async fn handle_inserttext(cmd: &Value, state: &DaemonState) -> Result<Value, St
 }
 
 /// Move the session cursor along a deterministic eased curve. Human mode adds
-/// a seeded perpendicular bend while preserving exact, reproducible endpoints.
+/// a seeded perpendicular bend and samples the path frequently enough for
+/// animation-heavy pages while preserving exact, reproducible endpoints.
 #[allow(clippy::too_many_arguments)]
 async fn move_mouse_interpolated(
     client: &CdpClient,
@@ -12344,9 +12345,7 @@ async fn move_mouse_interpolated(
     } else {
         duration_ms
     };
-    let steps = requested_steps
-        .unwrap_or_else(|| ((distance / 12.0).ceil() as usize).clamp(1, 60))
-        .clamp(1, 240);
+    let steps = interpolated_mouse_steps(distance, duration_ms, requested_steps, human);
     let bend = if human && distance > 0.0 {
         let mixed = seed
             .wrapping_mul(6364136223846793005)
@@ -12396,6 +12395,24 @@ async fn move_mouse_interpolated(
         }
     }
     Ok(())
+}
+
+fn interpolated_mouse_steps(
+    distance: f64,
+    duration_ms: u64,
+    requested_steps: Option<usize>,
+    human: bool,
+) -> usize {
+    requested_steps
+        .unwrap_or_else(|| {
+            let spatial_steps = ((distance / 12.0).ceil() as usize).clamp(1, 60);
+            if human && duration_ms > 0 {
+                spatial_steps.max(duration_ms.div_ceil(16) as usize)
+            } else {
+                spatial_steps
+            }
+        })
+        .clamp(1, 240)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14364,6 +14381,13 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert_eq!(midpoint, (50.0, 10.0));
         let endpoint = interpolated_mouse_point(0.0, 0.0, 100.0, 0.0, 0.0, 1.0, 10.0, 2, 2);
         assert_eq!(endpoint, (100.0, 0.0));
+    }
+
+    #[test]
+    fn human_mouse_path_samples_short_moves_at_animation_cadence() {
+        assert_eq!(interpolated_mouse_steps(10.0, 100, None, true), 7);
+        assert_eq!(interpolated_mouse_steps(10.0, 100, None, false), 1);
+        assert_eq!(interpolated_mouse_steps(10.0, 100, Some(3), true), 3);
     }
 
     #[test]

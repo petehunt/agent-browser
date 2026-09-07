@@ -48,6 +48,8 @@ agent-browser snapshot -i         # Interactive elements only (recommended)
 agent-browser snapshot -c         # Compact output
 agent-browser snapshot -d 3       # Limit depth to 3
 agent-browser snapshot -s "#main" # Scope to CSS selector
+agent-browser snapshot --delta     # Full state once, then bounded structural deltas
+agent-browser snapshot --delta --full # Force full state and refresh baseline
 ```
 
 ## Interactions (use @refs from snapshot)

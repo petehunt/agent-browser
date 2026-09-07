@@ -840,7 +840,9 @@ fn tools() -> Vec<Value> {
                 "compact": { "type": "boolean", "default": false, "description": "Remove empty structural elements." },
                 "depth": { "type": "integer", "minimum": 0, "description": "Limit tree depth." },
                 "selector": { "type": "string", "description": "Scope the snapshot to a CSS selector." },
-                "includeUrls": { "type": "boolean", "default": false, "description": "Include href URLs on links." }
+                "includeUrls": { "type": "boolean", "default": false, "description": "Include href URLs on links." },
+                "delta": { "type": "boolean", "default": false, "description": "Return full state once, then unchanged or bounded structural deltas." },
+                "full": { "type": "boolean", "default": false, "description": "Force full state while updating the delta baseline." }
             }),
             &[],
         ),
@@ -2589,6 +2591,12 @@ fn call_snapshot(arguments: &Value) -> Result<Value, ProtocolError> {
     if let Some(selector) = optional_string(arguments, "selector")? {
         args.push("-s".to_string());
         args.push(selector);
+    }
+    if optional_bool(arguments, "delta")?.unwrap_or(false) {
+        args.push("--delta".to_string());
+    }
+    if optional_bool(arguments, "full")?.unwrap_or(false) {
+        args.push("--full".to_string());
     }
 
     call_cli_tool(arguments, args, None)

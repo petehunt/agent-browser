@@ -930,6 +930,8 @@ agent-browser snapshot -c                 # Compact (remove empty structural ele
 agent-browser snapshot -d 3               # Limit depth to 3 levels
 agent-browser snapshot -s "#main"         # Scope to CSS selector
 agent-browser snapshot -i -c -d 5         # Combine options
+agent-browser snapshot --delta             # Full state, then bounded incremental updates
+agent-browser snapshot --delta --full      # Force full state and refresh the baseline
 ```
 
 | Option                 | Description                                                             |
@@ -939,6 +941,10 @@ agent-browser snapshot -i -c -d 5         # Combine options
 | `-c, --compact`        | Remove empty structural elements                                        |
 | `-d, --depth <n>`      | Limit tree depth                                                        |
 | `-s, --selector <sel>` | Scope to CSS selector                                                   |
+| `--delta`              | Return full state once, then `unchanged` or a structural JSON delta     |
+| `--full`               | Force full state and update the delta baseline                          |
+
+Delta snapshots are tracked per tab and option set. A URL change, a changed filter, or a delta that is not materially smaller than the full tree returns `kind: "full"`. Identical observations return `kind: "unchanged"`; modest changes return `kind: "delta"` with `add`, `remove`, and `replace` operations plus base and current revision numbers.
 
 ## Annotated Screenshots
 

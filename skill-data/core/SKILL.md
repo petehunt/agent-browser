@@ -84,9 +84,11 @@ agent-browser snapshot -i -c              # compact (no empty structural nodes)
 agent-browser snapshot -i -d 3            # cap depth at 3 levels
 agent-browser snapshot -s "#main"         # scope to a CSS selector
 agent-browser snapshot -i --json          # machine-readable output
+agent-browser snapshot -i --delta         # full state once, then compact changes
+agent-browser snapshot -i --delta --full  # force full state and refresh baseline
 ```
 
-Existing elements keep their refs across snapshots. Take a fresh snapshot after navigation.
+Existing elements keep their refs across snapshots. Delta observations are scoped per tab and option set.
 
 Snapshot output looks like:
 

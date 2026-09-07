@@ -275,6 +275,8 @@ Iframes are detected automatically during snapshots. `Iframe` nodes are resolved
 
 ```bash
 agent-browser snapshot -i
+agent-browser snapshot --delta
+agent-browser snapshot --delta --full
 # @e3 [Iframe] "payment-frame"
 #   @e4 [input] "Card number"
 #   @e5 [button] "Pay"
@@ -288,6 +290,8 @@ agent-browser frame @e3
 agent-browser snapshot -i             # Only elements inside that iframe
 agent-browser frame main              # Return to main frame
 ```
+
+`snapshot --delta` tracks observations per tab and option set. The first observation returns `kind: "full"`; an identical observation returns `kind: "unchanged"`; a modest change returns a structural `delta` with revision numbers and `add`, `remove`, or `replace` operations. URL changes and deltas that are not materially smaller than the tree automatically return full state. Add `--full` to force a full response and refresh the baseline.
 
 The `frame` command accepts element refs (`@e3`), CSS selectors (`"#my-iframe"`), or frame name/URL.
 

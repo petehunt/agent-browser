@@ -834,7 +834,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_SNAPSHOT,
             "Snapshot page",
-            "Return an accessibility-tree snapshot with durable DOM-backed refs and explicit removedRefs.",
+            "Return an accessibility-tree snapshot with durable DOM-backed refs and explicit removedRefs. Snapshot and URL content diffs ignore generated ref IDs.",
             json!({
                 "interactive": { "type": "boolean", "default": true, "description": "Only include interactive elements." },
                 "compact": { "type": "boolean", "default": false, "description": "Remove empty structural elements." },

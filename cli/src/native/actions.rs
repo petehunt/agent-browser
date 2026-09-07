@@ -6369,10 +6369,10 @@ async fn handle_diff_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Va
         selector,
         ..SnapshotOptions::default()
     };
-    // Start from the same ref base as a normal baseline snapshot so unchanged lines align.
+    // Reuse the current document identities without committing a failed capture.
     // Build the replacement separately so a failed diff leaves the existing refs usable.
     let mut current_ref_map = state.ref_map.clone();
-    current_ref_map.set_scope(&session_id);
+    current_ref_map.set_scope(&snapshot_document_scope(&mgr.client, &session_id).await);
     current_ref_map.clear();
     let current = snapshot::take_snapshot(
         &mgr.client,
@@ -6403,7 +6403,10 @@ async fn handle_diff_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Va
         None => String::new(),
     };
 
-    let result = diff::diff_snapshots(&baseline_text, &current);
+    let result = diff::diff_snapshots(
+        &diff::snapshot_comparison_text(&baseline_text),
+        &diff::snapshot_comparison_text(&current),
+    );
     state.ref_map = current_ref_map;
     Ok(json!({
         "diff": result.diff,
@@ -6440,7 +6443,7 @@ async fn handle_diff_url(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     let session_id = mgr.active_session_id()?.to_string();
     let options = SnapshotOptions::default();
     let mut snap1_ref_map = state.ref_map.clone();
-    snap1_ref_map.set_scope(&session_id);
+    snap1_ref_map.set_scope(&snapshot_document_scope(&mgr.client, &session_id).await);
     snap1_ref_map.invalidate_current_document();
     let snap1 = snapshot::take_snapshot(
         &mgr.client,
@@ -6456,6 +6459,7 @@ async fn handle_diff_url(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     snap1_ref_map.invalidate_current_document();
     mgr.navigate(url2, wait_until).await?;
     let mut snap2_ref_map = snap1_ref_map;
+    snap2_ref_map.set_scope(&snapshot_document_scope(&mgr.client, &session_id).await);
     let snap2 = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
@@ -6466,7 +6470,10 @@ async fn handle_diff_url(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     )
     .await?;
 
-    let result = diff::diff_text(&snap1, &snap2);
+    let result = diff::diff_text(
+        &diff::snapshot_comparison_text(&snap1),
+        &diff::snapshot_comparison_text(&snap2),
+    );
     state.ref_map = snap2_ref_map;
     Ok(json!({
         "diff": result,

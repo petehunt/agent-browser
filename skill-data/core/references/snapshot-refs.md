@@ -2,7 +2,7 @@
 
 Compact element references that reduce context usage dramatically for AI agents.
 
-DOM-backed refs are durable across observations. Identity is scoped by top-level document and frame, so React updates and DOM reordering preserve a surviving element's ref. A new document invalidates the old document's refs, and invalidated IDs are never recycled within the browser session. In JSON output, `removedRefs` lists refs that disappeared since the previous observation. Accessibility nodes without DOM backing use snapshot-local refs.
+DOM-backed refs are durable across observations. Identity is scoped by top-level document and frame, so React updates and DOM reordering preserve a surviving element's ref. A new document invalidates the old document's refs, and invalidated IDs are never recycled within the browser session. In JSON output, `removedRefs` lists refs that disappeared since the previous observation. Accessibility nodes without DOM backing use snapshot-local refs. Snapshot and URL diffs ignore generated ref annotations when comparing content; captured snapshots retain their actionable refs.
 
 **Related**: [commands.md](commands.md) for full command reference, [SKILL.md](../SKILL.md) for quick start.
 

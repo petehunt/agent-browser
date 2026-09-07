@@ -5425,6 +5425,7 @@ fn observe_screenshot(
     signature: String,
     base64_data: &str,
     threshold: f64,
+    options: &ScreenshotOptions,
 ) -> Result<Value, String> {
     let (width, height, rgba, decoded_hash) = decode_screenshot_pixels(base64_data)?;
     // Evict stale tab history before admitting another capture scope so decoded
@@ -5449,6 +5450,11 @@ fn observe_screenshot(
         || previous.is_some_and(|item| item.signature != signature)
         || pixel_change_ratio > threshold;
 
+    let path = if changed {
+        Some(screenshot::save_screenshot(base64_data, options)?)
+    } else {
+        None
+    };
     if changed {
         state.screenshot_observations.insert(
             key,
@@ -5464,12 +5470,16 @@ fn observe_screenshot(
     } else if let Some(previous) = state.screenshot_observations.get_mut(&key) {
         previous.revision = revision;
     }
-    Ok(json!({
+    let mut response = json!({
         "changed": changed,
         "revision": revision,
         "pixelChangeRatio": pixel_change_ratio,
         "threshold": threshold
-    }))
+    });
+    if let Some(path) = path {
+        response["path"] = json!(path);
+    }
+    Ok(response)
 }
 
 async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -5491,52 +5501,6 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
         annotate
     );
 
-    if let Some(ref wb) = state.webdriver_backend {
-        if state.browser.is_none() {
-            if annotate {
-                return Err(
-                    "Annotated screenshots are not yet implemented on the WebDriver backend"
-                        .to_string(),
-                );
-            }
-
-            let base64_data = wb.screenshot().await?;
-            let explicit_path = cmd.get("path").and_then(|v| v.as_str());
-            let path = explicit_path.map(String::from).unwrap_or_else(|| {
-                format!(
-                    "/tmp/screenshot-{}.png",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0)
-                )
-            });
-            let bytes =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &base64_data)
-                    .map_err(|e| format!("Base64 decode error: {}", e))?;
-            std::fs::write(&path, bytes)
-                .map_err(|e| format!("Failed to write screenshot: {}", e))?;
-            if if_changed {
-                let mut response = observe_screenshot(
-                    state,
-                    "webdriver-active".to_string(),
-                    signature,
-                    &base64_data,
-                    threshold,
-                )?;
-                if response["changed"].as_bool() == Some(true) {
-                    response["path"] = json!(path);
-                } else if explicit_path.is_none() {
-                    let _ = std::fs::remove_file(&path);
-                }
-                return Ok(response);
-            }
-            return Ok(json!({ "path": path }));
-        }
-    }
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
-
     let format = cmd
         .get("format")
         .or_else(|| cmd.get("type"))
@@ -5544,7 +5508,7 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
         .unwrap_or("png")
         .to_string();
 
-    let options = ScreenshotOptions {
+    let mut options = ScreenshotOptions {
         selector: cmd
             .get("selector")
             .and_then(|v| v.as_str())
@@ -5566,44 +5530,77 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
             .map(String::from),
     };
 
-    if annotate {
-        let document_scope = snapshot_document_scope(&mgr.client, &session_id).await;
-        state.ref_map.set_scope(&document_scope);
-        state.ref_map.clear();
-        let _ = snapshot::take_snapshot(
+    let (session_id, result) = if let Some(wb) = state
+        .webdriver_backend
+        .as_ref()
+        .filter(|_| state.browser.is_none())
+    {
+        if annotate {
+            return Err(
+                "Annotated screenshots are not yet implemented on the WebDriver backend"
+                    .to_string(),
+            );
+        }
+        options.path.get_or_insert_with(|| {
+            format!(
+                "/tmp/screenshot-{}.png",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            )
+        });
+        (
+            "webdriver-active".to_string(),
+            screenshot::ScreenshotResult {
+                base64: wb.screenshot().await?,
+                annotations: Vec::new(),
+            },
+        )
+    } else {
+        let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+        let session_id = mgr.active_session_id()?.to_string();
+        if annotate {
+            let document_scope = snapshot_document_scope(&mgr.client, &session_id).await;
+            state.ref_map.set_scope(&document_scope);
+            state.ref_map.clear();
+            let _ = snapshot::take_snapshot(
+                &mgr.client,
+                &session_id,
+                &SnapshotOptions {
+                    interactive: true,
+                    ..SnapshotOptions::default()
+                },
+                &mut state.ref_map,
+                state.active_frame_id.as_deref(),
+                &state.iframe_sessions,
+            )
+            .await?;
+        }
+
+        let result = screenshot::take_screenshot(
             &mgr.client,
             &session_id,
-            &SnapshotOptions {
-                interactive: true,
-                ..SnapshotOptions::default()
-            },
-            &mut state.ref_map,
-            state.active_frame_id.as_deref(),
+            &state.ref_map,
+            &options,
             &state.iframe_sessions,
         )
         .await?;
-    }
 
-    let result = screenshot::take_screenshot(
-        &mgr.client,
-        &session_id,
-        &state.ref_map,
-        &options,
-        &state.iframe_sessions,
-    )
-    .await?;
+        (session_id, result)
+    };
 
     let mut response = if if_changed {
-        let mut observation =
-            observe_screenshot(state, session_id, signature, &result.base64, threshold)?;
-        if observation["changed"].as_bool() == Some(true) {
-            observation["path"] = json!(result.path);
-        } else if options.path.is_none() {
-            let _ = std::fs::remove_file(&result.path);
-        }
-        observation
+        observe_screenshot(
+            state,
+            session_id,
+            signature,
+            &result.base64,
+            threshold,
+            &options,
+        )?
     } else {
-        json!({ "path": result.path })
+        json!({ "path": screenshot::save_screenshot(&result.base64, &options)? })
     };
     if !result.annotations.is_empty() {
         response["annotations"] = serde_json::to_value(&result.annotations)

@@ -1109,7 +1109,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_MOUSE_MOVE,
             "Mouse move",
-            "Move the mouse.",
+            "Move the mouse. Interpolation starts at the last pointer or element interaction.",
             json!({
                 "x": number_schema(),
                 "y": number_schema(),

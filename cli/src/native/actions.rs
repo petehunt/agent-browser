@@ -5443,6 +5443,7 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         &state.iframe_sessions,
     )
     .await?;
+    (state.mouse_state.x, state.mouse_state.y) = result.position;
 
     if result.dialog_opened {
         state.pending_pointer_release = result.pending_release;
@@ -5467,6 +5468,7 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &state.iframe_sessions,
     )
     .await?;
+    (state.mouse_state.x, state.mouse_state.y) = result.position;
     if result.dialog_opened {
         state.pending_pointer_release = result.pending_release;
         return Ok(json!({ "clicked": selector, "dialogOpened": true }));
@@ -5597,7 +5599,7 @@ async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
-    interaction::hover(
+    let position = interaction::hover(
         &mgr.client,
         &session_id,
         &state.ref_map,
@@ -5605,6 +5607,7 @@ async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         &state.iframe_sessions,
     )
     .await?;
+    (state.mouse_state.x, state.mouse_state.y) = position;
     Ok(json!({ "hovered": selector }))
 }
 
@@ -5683,14 +5686,17 @@ async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
-    interaction::check(
+    if let Some(position) = interaction::check(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
     )
-    .await?;
+    .await?
+    {
+        (state.mouse_state.x, state.mouse_state.y) = position;
+    }
     Ok(json!({ "checked": selector }))
 }
 
@@ -5702,14 +5708,17 @@ async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
-    interaction::uncheck(
+    if let Some(position) = interaction::uncheck(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
     )
-    .await?;
+    .await?
+    {
+        (state.mouse_state.x, state.mouse_state.y) = position;
+    }
     Ok(json!({ "unchecked": selector }))
 }
 
@@ -6865,7 +6874,7 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     let mut rx = mgr.client.subscribe();
 
     // Click the element to trigger the download
-    interaction::click(
+    let result = interaction::click(
         &mgr.client,
         &session_id,
         &state.ref_map,
@@ -6875,6 +6884,7 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &state.iframe_sessions,
     )
     .await?;
+    (state.mouse_state.x, state.mouse_state.y) = result.position;
 
     // Wait for download to complete
     const DOWNLOAD_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
@@ -9073,6 +9083,7 @@ async fn execute_subaction(
                 &state.iframe_sessions,
             )
             .await?;
+            (state.mouse_state.x, state.mouse_state.y) = result.position;
             if result.dialog_opened {
                 state.pending_pointer_release = result.pending_release;
                 return Ok(json!({ "clicked": selector, "dialogOpened": true }));
@@ -9096,18 +9107,21 @@ async fn execute_subaction(
             Ok(json!({ "filled": selector }))
         }
         "check" => {
-            interaction::check(
+            if let Some(position) = interaction::check(
                 &mgr.client,
                 &session_id,
                 &state.ref_map,
                 selector,
                 &state.iframe_sessions,
             )
-            .await?;
+            .await?
+            {
+                (state.mouse_state.x, state.mouse_state.y) = position;
+            }
             Ok(json!({ "checked": selector }))
         }
         "hover" => {
-            interaction::hover(
+            let position = interaction::hover(
                 &mgr.client,
                 &session_id,
                 &state.ref_map,
@@ -9115,6 +9129,7 @@ async fn execute_subaction(
                 &state.iframe_sessions,
             )
             .await?;
+            (state.mouse_state.x, state.mouse_state.y) = position;
             Ok(json!({ "hovered": selector }))
         }
         "text" => {
@@ -11567,7 +11582,7 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
             )
         })?
     };
-    interaction::click(
+    let result = interaction::click(
         &mgr.client,
         &session_id,
         &state.ref_map,
@@ -11577,6 +11592,7 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
         &state.iframe_sessions,
     )
     .await?;
+    (state.mouse_state.x, state.mouse_state.y) = result.position;
 
     // Wait for navigation after submit (with fallback timeout)
     let mut rx = mgr.client.subscribe();

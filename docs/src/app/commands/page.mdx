@@ -158,7 +158,7 @@ agent-browser mouse up [button]       # Release button
 agent-browser mouse wheel <dy> [dx]   # Scroll wheel
 ```
 
-Use `--human` with `click`, `drag`, or `mouse move` to emit reproducible eased movement along a slightly curved path. The cursor position persists for the browser session. `--duration` controls total milliseconds, `--steps` controls the number of intermediate events, and `--seed` makes the human curve reproducible.
+Use `--human` with `click`, `drag`, or `mouse move` to emit reproducible eased movement along a slightly curved path. The cursor position persists for the browser session. `--duration` controls total milliseconds, `--steps` controls the number of intermediate events, and `--seed` makes the human curve reproducible. Pointer interpolation starts at the last dispatched cursor position, including element clicks, hovers, and checkbox interactions.
 
 ## Clipboard
 

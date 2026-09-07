@@ -148,7 +148,7 @@ agent-browser mouse up left           # Release button
 agent-browser mouse wheel 100         # Scroll wheel
 ```
 
-Use `click <selector> --human` or `drag <source> <target> --human` when pointer-path events matter. Human movement is deterministic for a given `--seed` and always ends at the exact target.
+Use `click <selector> --human` or `drag <source> <target> --human` when pointer-path events matter. Human movement is deterministic for a given `--seed` and always ends at the exact target. Pointer interpolation starts at the last dispatched cursor position, including element clicks, hovers, and checkbox interactions.
 
 ## Semantic Locators (alternative to refs)
 

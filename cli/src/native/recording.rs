@@ -1442,6 +1442,7 @@ async fn encode_stream(
     let mut decoded = None;
     let mut last_page: Option<Arc<Vec<u8>>> = None;
     let mut last_cursor = None;
+    let mut last_ripple_active = false;
     let mut written = 0u64;
 
     loop {
@@ -1473,7 +1474,7 @@ async fn encode_stream(
                 let page_changed = last_page
                     .as_deref()
                     .is_none_or(|previous| previous != frame.image_data.as_slice());
-                if !page_changed && cursor_state == last_cursor && !ripple_active {
+                if !page_changed && cursor_state == last_cursor && !ripple_active && !last_ripple_active {
                     continue;
                 }
                 if cursor {
@@ -1485,6 +1486,7 @@ async fn encode_stream(
                     write_encoder_bytes(&mut stdin, &frame.image_data).await?;
                 }
                 last_page = Some(frame.image_data.clone());
+                last_ripple_active = ripple_active;
                 written += 1;
             }
         }

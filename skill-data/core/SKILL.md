@@ -88,7 +88,7 @@ agent-browser snapshot -i --delta         # full state once, then compact change
 agent-browser snapshot -i --delta --full  # force full state and refresh baseline
 ```
 
-Delta observations are per tab and option set. Expect `full`, `unchanged`, or `delta`; a delta includes base and current revisions plus structural ref operations. The daemon automatically falls back to full state when the URL changes or the delta would not save meaningful output. A `delta` includes ref metadata operations in `changes` and an exact `treeChange` splice. Split the previous tree on newlines, replace `deleteCount` lines starting at zero-based `startLine` with `lines`, then join with newlines. Apply both parts before advancing to the new revision; this preserves text, values, checked state, hierarchy, and ordering.
+Use `--delta` to reduce repeated snapshot output and `--full` to reset the baseline. See [delta responses](references/commands.md#snapshot-page-analysis) before applying incremental updates.
 
 Snapshot output looks like:
 

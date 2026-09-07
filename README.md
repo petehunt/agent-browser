@@ -942,7 +942,7 @@ agent-browser snapshot --delta --full      # Force full state and refresh the ba
 | `--delta`              | Return full state once, then `unchanged` or a structural JSON delta     |
 | `--full`               | Force full state and update the delta baseline                          |
 
-Delta snapshots are tracked per tab and option set. A URL change, a changed filter, or a delta that is not materially smaller than the full tree returns `kind: "full"`. Identical observations return `kind: "unchanged"`; modest changes return `kind: "delta"` with `add`, `remove`, and `replace` operations plus base and current revision numbers. A `delta` includes ref metadata operations in `changes` and an exact `treeChange` splice. Split the previous tree on newlines, replace `deleteCount` lines starting at zero-based `startLine` with `lines`, then join with newlines. Apply both parts before advancing to the new revision; this preserves text, values, checked state, hierarchy, and ordering.
+`--delta` returns `full`, `unchanged`, or incremental updates per tab and option set. It falls back to full state after URL changes or when a delta would not save space. See the [delta response format](skill-data/core/references/commands.md#snapshot-page-analysis) for applying updates.
 
 ## Annotated Screenshots
 

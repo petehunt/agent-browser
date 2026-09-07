@@ -1,5 +1,4 @@
 use serde_json::{json, Value};
-use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,11 +19,18 @@ pub const DEFAULT_FPS: u32 = 30;
 /// work) where the extra temporal detail is the point.
 pub const MAX_FPS: u32 = 60;
 
-/// Rate above which the deferred encoder uses a second thread.
+/// Rate above which the live encoder uses additional threads.
 const HIGH_FPS_THRESHOLD: u32 = 30;
+const HIGH_FPS_ENCODER_THREADS: &str = "4";
 
 /// VP8 budget chosen for readable UI text and thin drawing strokes.
 const WEBM_BITRATE_KBPS: u32 = 8000;
+
+/// Captured frames may wait briefly for compositing, but overload must fail
+/// the recording instead of silently degrading it into held frames.
+const ENCODER_FRAME_BUFFER: usize = 16;
+const MAX_ENCODER_LAG: Duration = Duration::from_millis(500);
+const ENCODER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Upper bound on waiting for Chrome to acknowledge screencast teardown.
 /// The page may already be gone by the time a recording stops.
@@ -39,6 +45,10 @@ pub fn validate_fps(fps: u32) -> Result<u32, String> {
         ));
     }
     Ok(fps)
+}
+
+fn frame_period(fps: u32) -> Duration {
+    Duration::from_micros(1_000_000 / fps.clamp(1, MAX_FPS) as u64)
 }
 
 /// The CDP session a recording attaches to its page target for its screencast.
@@ -74,9 +84,9 @@ pub struct RecordingState {
     pub output_path: String,
     /// Capture rate for the active (or most recent) recording.
     pub fps: u32,
-    /// Frames written to the file, including frames held through gaps.
+    /// Frames written to the file.
     pub frame_count: u64,
-    /// Distinct frames received from the screencast.
+    /// Frames received from the screencast.
     pub captured_count: u64,
     pub capture_task: Option<tokio::task::JoinHandle<Result<(), String>>>,
     pub shared_frame_count: Option<Arc<AtomicU64>>,
@@ -161,6 +171,7 @@ fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Command 
 
     cmd.args(["-y", "-loglevel", "error"])
         .args(["-avioflags", "direct"])
+        .args(["-use_wallclock_as_timestamps", "1"])
         .args([
             "-fpsprobesize",
             "0",
@@ -169,22 +180,38 @@ fn build_ffmpeg_command(output_path: &str, fps: u32) -> tokio::process::Command 
             "-analyzeduration",
             "0",
         ])
-        .args(["-f", "image2pipe", "-c:v", "png", "-framerate"])
-        .arg(fps.to_string())
-        .args(["-i", "pipe:0"])
-        .args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"]);
+        .args([
+            "-f",
+            "image2pipe",
+            "-c:v",
+            "png",
+            "-framerate",
+            &fps.to_string(),
+            "-i",
+            "pipe:0",
+        ])
+        .args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"])
+        .args(["-fps_mode", "vfr"]);
 
     if output_path.ends_with(".webm") {
         cmd.args(["-c:v", "libvpx", "-crf", "18"])
-            .args(["-b:v", &format!("{}k", WEBM_BITRATE_KBPS)]);
+            .args(["-b:v", &format!("{}k", WEBM_BITRATE_KBPS)])
+            .args(["-deadline", "realtime", "-cpu-used", "4"]);
     } else {
         cmd.args(["-c:v", "libx264", "-preset", "ultrafast"]);
     }
 
-    // One encoder thread is enough at ordinary rates; 60 fps benefits from a
-    // second thread during deferred encoding.
+    // One encoder thread keeps CPU away from the browser at ordinary rates;
+    // above 30 fps the encoder needs more workers to drain the pipe in time.
     cmd.args(["-pix_fmt", "yuv420p"])
-        .args(["-threads", if high_fps { "2" } else { "1" }])
+        .args([
+            "-threads",
+            if high_fps {
+                HIGH_FPS_ENCODER_THREADS
+            } else {
+                "1"
+            },
+        ])
         .arg(output_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -248,19 +275,13 @@ pub async fn attach_capture_session(
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct CapturedVideoFrame {
-    path: std::path::PathBuf,
-    elapsed: Duration,
+    image_data: Arc<Vec<u8>>,
+    captured_at: tokio::time::Instant,
 }
 
-#[derive(Debug)]
-struct CapturedRecording {
-    frames: Vec<CapturedVideoFrame>,
-    duration: Duration,
-}
-
-/// Capture lossless frames first, then encode them after the take ends.
+/// Drain Chrome independently from the encoder so FFmpeg cannot stall frame ACKs.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_recording_task(
     client: Arc<CdpClient>,
@@ -274,8 +295,8 @@ pub fn spawn_recording_task(
     tokio::spawn(async move {
         let fps = validate_fps(fps)?;
         let events = client.subscribe_session(&capture_session);
-        let capture_dir = tempfile::tempdir()
-            .map_err(|e| format!("Failed to create recording frame directory: {}", e))?;
+        let (frame_tx, frame_rx) = mpsc::channel(ENCODER_FRAME_BUFFER);
+        let encoder = tokio::spawn(encode_stream(output_path, fps, frame_rx));
 
         let started = client
             .send_command(
@@ -291,13 +312,13 @@ pub fn spawn_recording_task(
             )
             .await;
 
-        let capture = match started {
+        let captured = match started {
             Ok(_) => {
                 collect_frames(
                     &client,
                     &capture_session,
                     events,
-                    capture_dir.path(),
+                    frame_tx,
                     &shared_captured,
                     cancel_rx,
                 )
@@ -324,9 +345,24 @@ pub fn spawn_recording_task(
         )
         .await;
 
-        let capture = capture?;
-        let written = encode_capture(&capture, &output_path, fps).await?;
-        shared_count.store(written, Ordering::Relaxed);
+        if let Err(error) = captured {
+            if error == "Recording encoder stopped unexpectedly" {
+                return match encoder.await {
+                    Ok(Err(encoder_error)) => Err(encoder_error),
+                    Ok(Ok(_)) => Err(error),
+                    Err(join_error) => {
+                        Err(format!("Recording encoder task failed: {}", join_error))
+                    }
+                };
+            }
+            encoder.abort();
+            let _ = encoder.await;
+            return Err(error);
+        }
+        let streamed = encoder
+            .await
+            .map_err(|e| format!("Recording encoder task failed: {}", e))??;
+        shared_count.store(streamed, Ordering::Relaxed);
         Ok(())
     })
 }
@@ -335,13 +371,11 @@ async fn collect_frames(
     client: &CdpClient,
     capture_session: &str,
     mut events: mpsc::Receiver<super::cdp::types::CdpEvent>,
-    directory: &Path,
+    frame_tx: mpsc::Sender<CapturedVideoFrame>,
     shared_captured: &AtomicU64,
     cancel_rx: oneshot::Receiver<()>,
-) -> Result<CapturedRecording, String> {
+) -> Result<(), String> {
     let mut cancel_rx = std::pin::pin!(cancel_rx);
-    let started = tokio::time::Instant::now();
-    let mut frames = Vec::new();
 
     loop {
         tokio::select! {
@@ -367,15 +401,20 @@ async fn collect_frames(
                                 .ok()
                         });
                     if let Some(bytes) = decoded {
-                        let index = frames.len();
-                        let path = directory.join(format!("frame-{index:08}.png"));
-                        tokio::fs::write(&path, bytes).await
-                            .map_err(|e| format!("Failed to spool recording frame: {}", e))?;
-                        frames.push(CapturedVideoFrame {
-                            path,
-                            elapsed: started.elapsed(),
-                        });
+                        let frame = CapturedVideoFrame {
+                            image_data: Arc::new(bytes),
+                            captured_at: tokio::time::Instant::now(),
+                        };
                         shared_captured.fetch_add(1, Ordering::Relaxed);
+                        frame_tx.try_send(frame).map_err(|error| match error {
+                            mpsc::error::TrySendError::Full(_) => format!(
+                                "Recording encoder fell behind by more than {} buffered frames",
+                                ENCODER_FRAME_BUFFER
+                            ),
+                            mpsc::error::TrySendError::Closed(_) => {
+                                "Recording encoder stopped unexpectedly".to_string()
+                            }
+                        })?;
                     }
                 } else if event.method == "Inspector.detached" {
                     // The recorded page was closed; finish the file.
@@ -384,22 +423,25 @@ async fn collect_frames(
             }
         }
     }
-
-    if frames.is_empty() {
-        return Err("No frames captured".to_string());
-    }
-    Ok(CapturedRecording {
-        frames,
-        duration: started.elapsed(),
-    })
+    Ok(())
 }
 
-async fn encode_capture(
-    capture: &CapturedRecording,
-    output_path: &str,
+async fn write_encoder_bytes(
+    stdin: &mut tokio::process::ChildStdin,
+    bytes: &[u8],
+) -> Result<(), String> {
+    tokio::time::timeout(ENCODER_WRITE_TIMEOUT, stdin.write_all(bytes))
+        .await
+        .map_err(|_| "Recording encoder pipe was blocked for more than 2 seconds".to_string())?
+        .map_err(|e| format!("ffmpeg write failed: {}", e))
+}
+
+async fn encode_stream(
+    output_path: String,
     fps: u32,
+    mut frames: mpsc::Receiver<CapturedVideoFrame>,
 ) -> Result<u64, String> {
-    let mut command = build_ffmpeg_command(output_path, fps);
+    let mut command = build_ffmpeg_command(&output_path, fps);
     let mut ffmpeg = command.spawn().map_err(|e| {
         format!(
             "ffmpeg not found or failed to execute: {}. Install ffmpeg to enable recording.",
@@ -410,30 +452,41 @@ async fn encode_capture(
         .stdin
         .take()
         .ok_or_else(|| "Failed to open ffmpeg stdin".to_string())?;
-    let total = (capture.duration.as_secs_f64() * fps as f64)
-        .ceil()
-        .max(1.0) as u64;
-    let mut page_index = 0usize;
-    let mut loaded_index = usize::MAX;
-    let mut clean_bytes = Vec::new();
+    let mut interval = tokio::time::interval(frame_period(fps));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut latest: Option<CapturedVideoFrame> = None;
+    let mut last_page: Option<Arc<Vec<u8>>> = None;
+    let mut written = 0u64;
 
-    for slot in 0..total {
-        let elapsed = Duration::from_secs_f64(slot as f64 / fps as f64);
-        while page_index + 1 < capture.frames.len()
-            && capture.frames[page_index + 1].elapsed <= elapsed
-        {
-            page_index += 1;
+    loop {
+        tokio::select! {
+            frame = frames.recv() => {
+                let Some(frame) = frame else { break };
+                if frame.captured_at.elapsed() > MAX_ENCODER_LAG {
+                    return Err("Recording encoder fell more than 500 ms behind capture".to_string());
+                }
+                latest = Some(frame);
+            }
+            _ = interval.tick() => {
+                let Some(frame) = latest.as_ref() else { continue };
+                let page_changed = last_page
+                    .as_deref()
+                    .is_none_or(|previous| previous != frame.image_data.as_slice());
+                if !page_changed {
+                    continue;
+                }
+                write_encoder_bytes(&mut stdin, &frame.image_data).await?;
+                last_page = Some(frame.image_data.clone());
+                written += 1;
+            }
         }
-        if loaded_index != page_index {
-            clean_bytes = std::fs::read(&capture.frames[page_index].path)
-                .map_err(|e| format!("Failed to read recording frame: {}", e))?;
-            loaded_index = page_index;
-        }
-        stdin
-            .write_all(&clean_bytes)
-            .await
-            .map_err(|e| format!("ffmpeg write failed: {}", e))?;
     }
+
+    let Some(frame) = latest.as_ref() else {
+        return Err("No frames captured".to_string());
+    };
+    write_encoder_bytes(&mut stdin, &frame.image_data).await?;
+    written += 1;
     drop(stdin);
 
     let output = ffmpeg
@@ -447,7 +500,7 @@ async fn encode_capture(
             stderr.chars().take(300).collect::<String>()
         ));
     }
-    Ok(total)
+    Ok(written)
 }
 
 pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), String> {
@@ -600,15 +653,24 @@ mod tests {
     }
 
     #[test]
+    fn test_frame_period_matches_requested_rate() {
+        assert_eq!(frame_period(1), Duration::from_secs(1));
+        assert_eq!(frame_period(30), Duration::from_micros(33_333));
+        assert_eq!(frame_period(60), Duration::from_micros(16_666));
+    }
+
+    #[test]
     fn test_build_ffmpeg_command_webm() {
         let cmd = build_ffmpeg_command("/tmp/out.webm", DEFAULT_FPS);
         let args: Vec<&std::ffi::OsStr> = cmd.as_std().get_args().collect();
         let args_str: Vec<&str> = args.iter().filter_map(|a| a.to_str()).collect();
         assert!(args_str.contains(&"libvpx"));
         assert!(args_str.contains(&"/tmp/out.webm"));
-        assert!(args_str.contains(&"png"));
-        assert!(args_str.contains(&"18"));
         assert!(args_str.contains(&"8000k"));
+        assert!(args_str.contains(&"18"));
+        assert!(args_str.contains(&"png"));
+        assert!(args_str.contains(&"-use_wallclock_as_timestamps"));
+        assert!(args_str.contains(&"vfr"));
     }
 
     #[test]
@@ -640,7 +702,8 @@ mod tests {
             .position(|a| a == "-threads")
             .and_then(|i| args.get(i + 1))
             .map(String::as_str);
-        assert_eq!(threads, Some("2"));
+        assert_eq!(threads, Some(HIGH_FPS_ENCODER_THREADS));
+        assert!(args.iter().any(|a| a == "realtime"));
     }
 
     #[test]

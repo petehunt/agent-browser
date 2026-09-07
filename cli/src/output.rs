@@ -642,6 +642,30 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
             print_with_boundaries(snapshot, origin, opts);
             return;
         }
+        if let Some(snapshot) = data.get("snapshot").and_then(|v| v.as_object()) {
+            match snapshot.get("kind").and_then(|v| v.as_str()) {
+                Some("full") => {
+                    if let Some(tree) = snapshot.get("tree").and_then(|v| v.as_str()) {
+                        print_with_boundaries(tree, origin, opts);
+                    }
+                }
+                Some("unchanged") => println!(
+                    "unchanged (revision {})",
+                    snapshot
+                        .get("revision")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                ),
+                Some("delta") => println!(
+                    "{}",
+                    serde_json::to_string_pretty(snapshot).unwrap_or_else(|_| {
+                        serde_json::Value::Object(snapshot.clone()).to_string()
+                    })
+                ),
+                _ => println!("{}", serde_json::Value::Object(snapshot.clone())),
+            }
+            return;
+        }
         // Title
         if let Some(title) = data.get("title").and_then(|v| v.as_str()) {
             println!("{}", title);
@@ -2133,6 +2157,8 @@ Options:
   -c, --compact        Remove empty structural elements
   -d, --depth <n>      Limit tree depth
   -s, --selector <sel> Scope snapshot to CSS selector
+      --delta          Return full state once, then unchanged or structural deltas
+      --full           Force full state and update the delta baseline
 
 Global Options:
   --json               Output as JSON
@@ -2144,6 +2170,8 @@ Examples:
   agent-browser snapshot -i --urls
   agent-browser snapshot --compact --depth 5
   agent-browser snapshot -s "#main-content"
+  agent-browser snapshot --delta
+  agent-browser snapshot --delta --full
 "##
         }
 

@@ -84,7 +84,11 @@ agent-browser snapshot -i -c              # compact (no empty structural nodes)
 agent-browser snapshot -i -d 3            # cap depth at 3 levels
 agent-browser snapshot -s "#main"         # scope to a CSS selector
 agent-browser snapshot -i --json          # machine-readable output
+agent-browser snapshot -i --delta         # full state once, then compact changes
+agent-browser snapshot -i --delta --full  # force full state and refresh baseline
 ```
+
+Delta observations are per tab and option set. Expect `full`, `unchanged`, or `delta`; a delta includes base and current revisions plus structural ref operations. The daemon automatically falls back to full state when the URL changes or the delta would not save meaningful output.
 
 Snapshot output looks like:
 

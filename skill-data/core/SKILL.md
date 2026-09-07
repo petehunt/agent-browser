@@ -286,7 +286,7 @@ agent-browser screenshot --if-changed           # return a path only when pixels
 agent-browser screenshot --threshold 0.01       # ignore changes affecting at most 1% of pixels
 ```
 
-Conditional screenshots are tracked per tab and capture scope. The first capture is changed. Later captures return `changed`, `revision`, and `pixelChangeRatio`; unchanged captures omit the path so agents and MCP clients do not resend identical image content. Comparison uses decoded RGBA pixels, so image encoding metadata does not count as a page change.
+Use `--if-changed` in polling loops to skip unchanged images. The first capture returns a path; later unchanged captures omit it. See [conditional screenshot responses](references/commands.md#screenshots-and-pdf) for JSON fields.
 
 Headless Chromium screenshots hide native scrollbars for consistent image output. Pass `--hide-scrollbars false` when launching to keep native scrollbars visible.
 

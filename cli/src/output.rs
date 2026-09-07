@@ -2821,7 +2821,7 @@ Operations:
 
 Options:
   --fps <n>                       Capture rate, 1-60 (default: 30)
-  --contact-sheet                 Save first, changed, and final frames as a PNG
+  --contact-sheet                 Save distinct visual changes as a timestamped PNG
   --contact-sheet-threshold <n>   Changed-pixel ratio, 0-1 (default: 0.05)
 
 Global Options:

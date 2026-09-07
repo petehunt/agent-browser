@@ -75,7 +75,7 @@ The video uses the requested frame rate and holds the latest Chrome frame betwee
 
 ## Contact Sheets
 
-Pass `--contact-sheet` to save `<recording-name>.contact-sheet.png` beside the video. It includes the first and final frames plus frames that meet the change threshold. Timestamps and red-tinted regions highlight changes.
+Pass `--contact-sheet` to create a timestamped summary with highlighted changes.
 
 ```bash
 agent-browser record start ./checkout.webm --contact-sheet

@@ -1090,6 +1090,20 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
                         path,
                         recording_fps_suffix(data)
                     );
+                    if let Some(contact_sheet) =
+                        data.get("contactSheetPath").and_then(|v| v.as_str())
+                    {
+                        let frames = data
+                            .get("contactSheetFrames")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        println!(
+                            "{} Contact sheet saved to {} ({} frames)",
+                            color::success_indicator(),
+                            contact_sheet,
+                            frames
+                        );
+                    }
                 }
             } else {
                 println!("{} Recording stopped", color::success_indicator());
@@ -1633,7 +1647,7 @@ Examples:
             r##"
 agent-browser click - Click an element
 
-Usage: agent-browser click <selector> [--new-tab]
+Usage: agent-browser click <selector> [--new-tab] [--human]
 
 Clicks on the specified element. The selector can be a CSS selector,
 XPath, or an element reference from snapshot (e.g., @e1).
@@ -1644,6 +1658,8 @@ covering element instead of dispatching a click to the wrong target.
 Options:
   --new-tab            Open link in a new tab instead of navigating current tab
                        (only works on elements with href attribute)
+  --human              Approach along a reproducible eased curve
+                       Starts at the last pointer or element interaction
 
 Global Options:
   --json               Output as JSON
@@ -1655,6 +1671,7 @@ Examples:
   agent-browser click "button.primary"
   agent-browser click "//button[@type='submit']"
   agent-browser click @e3 --new-tab
+  agent-browser click @e3 --human
 "##
         }
         "dblclick" => {
@@ -1808,7 +1825,7 @@ Examples:
             r##"
 agent-browser drag - Drag and drop
 
-Usage: agent-browser drag <source> <target>
+Usage: agent-browser drag <source> <target> [--human]
 
 Drags an element from source to target location.
 
@@ -1819,6 +1836,7 @@ Global Options:
 Examples:
   agent-browser drag "#draggable" "#drop-zone"
   agent-browser drag @e1 @e2
+  agent-browser drag @e1 @e2 --human
 "##
         }
         "upload" => {
@@ -2353,6 +2371,8 @@ Global Options:
 
 Examples:
   agent-browser mouse move 100 200
+  agent-browser mouse move 600 400 --duration 250 --steps 24
+  agent-browser mouse move 600 400 --human --seed 42
   agent-browser mouse down
   agent-browser mouse up
   agent-browser mouse down right
@@ -2788,9 +2808,9 @@ The output file can be viewed in:
             r##"
 agent-browser record - Record browser session to video
 
-Usage: agent-browser record start <path.webm> [url] [--fps <n>]
+Usage: agent-browser record start <path.webm> [url] [--fps <n>] [--cursor] [--contact-sheet]
        agent-browser record stop
-       agent-browser record restart <path.webm> [url] [--fps <n>]
+       agent-browser record restart <path.webm> [url] [--fps <n>] [--cursor] [--contact-sheet]
 
 Record the browser to a WebM video file.
 Records the current active page as-is: no new context, no new tab, and no
@@ -2809,7 +2829,10 @@ Operations:
   restart <path> [url]   Stop current recording (if any) and start a new one
 
 Options:
-  --fps <n>            Capture rate, 1-60 (default: 30)
+  --fps <n>                       Capture rate, 1-60 (default: 30)
+  --cursor                        Show an animated pointer
+  --contact-sheet                 Save distinct visual changes as a timestamped PNG
+  --contact-sheet-threshold <n>   Changed-pixel ratio, 0-1 (default: 0.05)
 
 Global Options:
   --json               Output as JSON
@@ -2835,6 +2858,9 @@ Examples:
 
   # 10 fps for a long session where size matters more than motion
   agent-browser record start ./soak.webm --fps 10
+
+  # Export a visual summary beside the video
+  agent-browser record start ./demo.webm --cursor --contact-sheet
 
   # Restart recording with a new file (stops previous, starts new)
   agent-browser record restart ./take2.webm
@@ -3738,7 +3764,7 @@ Debug:
   trace start                Start Chrome DevTools trace
   trace stop [path]          Stop and save Chrome DevTools trace
   profiler start|stop [path] Record Chrome DevTools profile
-  record start <path> [url]  Start video recording (WebM, 30 fps; --fps 1-60)
+  record start <path> [url]  Start video recording (WebM; supports cursor and contact sheet)
   record stop                Stop and save video
   console [--clear]          View console logs
   errors [--clear]           View page errors
@@ -3894,6 +3920,7 @@ Options:
   --screenshot-dir <path>    Default screenshot output directory (or AGENT_BROWSER_SCREENSHOT_DIR)
   --screenshot-quality <n>   JPEG quality 0-100; ignored for PNG (or AGENT_BROWSER_SCREENSHOT_QUALITY)
   --screenshot-format <fmt>  Screenshot format: png, jpeg (or AGENT_BROWSER_SCREENSHOT_FORMAT)
+  --input-mode <mode>        Pointer movement: instant (default), smooth, human
   --headed                   Show browser window (not headless) (or AGENT_BROWSER_HEADED env)
   --webgpu                   Enable WebGPU; uses SwiftShader software Vulkan on Linux, no GPU required (or AGENT_BROWSER_WEBGPU env)
   --no-webmcp                Disable default experimental WebMCP support for locally launched Chrome

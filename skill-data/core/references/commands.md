@@ -122,9 +122,11 @@ agent-browser record restart ./take2.webm # Stop current + start new
 agent-browser record start ./scroll.webm --fps 60  # 60 fps for motion-heavy takes
 agent-browser record start ./soak.webm --fps 10    # Lower rate for long sessions
 agent-browser tab new https://example.com          # Open a separate tab first if you want the recording there
+agent-browser record start ./demo.webm --cursor    # Add an animated mouse pointer
+agent-browser record start ./demo.webm --contact-sheet # Save a timestamped PNG summary
 ```
 
-`--fps` accepts 1 to 60 and defaults to 30. Playback duration always matches the wall clock time recorded, so a slow page holds frames instead of speeding the video up.
+`--fps` accepts 1 to 60 and defaults to 30. Playback duration always matches the wall clock time recorded, so a slow page holds frames instead of speeding the video up. `--contact-sheet-threshold <0-1>` changes how much of the image must differ before another contact-sheet frame is selected and implies `--contact-sheet`.
 
 ## Wait
 
@@ -140,11 +142,15 @@ agent-browser wait --fn "window.ready"     # Wait for JS condition (or -f)
 ## Mouse Control
 
 ```bash
-agent-browser mouse move 100 200      # Move mouse
+agent-browser mouse move 100 200      # Move mouse instantly
+agent-browser mouse move 600 400 --duration 250 --steps 24
+agent-browser mouse move 600 400 --human --seed 42
 agent-browser mouse down left         # Press button
 agent-browser mouse up left           # Release button
 agent-browser mouse wheel 100         # Scroll wheel
 ```
+
+Use `--human` with `click` or `drag` when pointer-path events matter. Movement starts at the current cursor position and ends at the target; `mouse move --seed` makes the path reproducible.
 
 ## Semantic Locators (alternative to refs)
 

@@ -291,11 +291,15 @@ agent-browser clipboard paste                     # Paste from clipboard (Ctrl+V
 ### Mouse Control
 
 ```bash
-agent-browser mouse move <x> <y>      # Move mouse
+agent-browser mouse move <x> <y>      # Move mouse instantly
+agent-browser mouse move 600 400 --duration 250 --steps 24 # Smooth movement
+agent-browser mouse move 600 400 --human --seed 42 # Reproducible curved movement
 agent-browser mouse down [button]     # Press button (left/right/middle)
 agent-browser mouse up [button]       # Release button
 agent-browser mouse wheel <dy> [dx]   # Scroll wheel
 ```
+
+Add `--human` to `click` or `drag` for curved, eased movement from the current cursor position.
 
 ### Browser Settings
 
@@ -416,6 +420,8 @@ agent-browser profiler start          # Start Chrome DevTools profiling
 agent-browser profiler stop [path]    # Stop and save profile (.json)
 agent-browser record start ./demo.webm           # Start video recording at 30 fps
 agent-browser record start ./demo.webm --fps 60  # 60 fps for motion-heavy takes (1-60 allowed)
+agent-browser record start ./demo.webm --cursor  # Include an animated pointer
+agent-browser record start ./demo.webm --contact-sheet # Save a PNG with distinct changed areas
 agent-browser record stop                        # Stop and save the video
 agent-browser record restart ./take2.webm        # Stop the current recording, start a new one
 agent-browser console                 # View console messages (log, error, warn, info)
@@ -1012,6 +1018,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--confirm-actions <list>` | Action categories requiring confirmation (or `AGENT_BROWSER_CONFIRM_ACTIONS` env) |
 | `--confirm-interactive` | Interactive confirmation prompts; auto-denies if stdin is not a TTY (or `AGENT_BROWSER_CONFIRM_INTERACTIVE` env) |
 | `--engine <name>` | Browser engine: `chrome` (default), `lightpanda` (or `AGENT_BROWSER_ENGINE` env) |
+| `--input-mode <mode>` | Session pointer movement: `instant` (default), `smooth`, or `human` |
 | `--idle-timeout <time>` | Shut down the daemon after inactivity (`10s`, `3m`, `1h`, or raw ms). Defaults to `1h`; use `0` to disable (or `AGENT_BROWSER_IDLE_TIMEOUT_MS` env) |
 | `--no-auto-dialog` | Disable automatic dismissal of `alert`/`beforeunload` dialogs (or `AGENT_BROWSER_NO_AUTO_DIALOG` env) |
 | `--model <name>` | AI model for chat command (or `AI_GATEWAY_MODEL` env) |

@@ -126,6 +126,7 @@ For sessions that handle sensitive data, use `--allowed-domains` to restrict nav
 ```bash
 agent-browser click @e1                   # click
 agent-browser click @e1 --new-tab         # open link in new tab instead of navigating
+agent-browser click @e1 --human           # approach with reproducible curved movement
 agent-browser dblclick @e1                # double-click
 agent-browser hover @e1                   # hover
 agent-browser focus @e1                   # focus (useful before keyboard input)
@@ -141,6 +142,7 @@ agent-browser upload @e5 file1.pdf        # upload file(s)
 agent-browser scroll down 500             # scroll page (up/down/left/right)
 agent-browser scrollintoview @e1          # scroll element into view
 agent-browser drag @e1 @e2                # drag and drop
+agent-browser drag @e1 @e2 --human        # drag with curved, eased movement
 ```
 
 ### When refs don't work or you don't want to snapshot
@@ -338,13 +340,13 @@ agent-browser network har stop /tmp/trace.har
 
 ```bash
 agent-browser open https://example.com
-agent-browser record start demo.webm          # records the current page in place, 30 fps
+agent-browser record start demo.webm --cursor --contact-sheet
 agent-browser snapshot -i
 agent-browser click @e3
 agent-browser record stop
 ```
 
-`record start` attaches to the active tab as-is (no new context, no navigation unless you pass a URL). To record in a separate tab, run `tab new <url>` first. Pass `--fps 60` for motion-heavy takes (drag, animation, scroll work) or a lower rate for long sessions; `--fps` accepts 1 to 60.
+`record start` records the active tab. Use `--cursor` for an animated pointer, `--contact-sheet` for a visual summary, and `--fps 60` for motion-heavy recordings.
 
 See [references/video-recording.md](references/video-recording.md) for frame rate guidance, codec options, and more.
 

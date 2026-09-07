@@ -431,18 +431,22 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
         // === Core Actions ===
         "click" => {
             let new_tab = rest.contains(&"--new-tab");
+            let human = rest.contains(&"--human");
             let sel = rest
                 .iter()
-                .find(|arg| **arg != "--new-tab")
+                .find(|arg| **arg != "--new-tab" && **arg != "--human")
                 .ok_or_else(|| ParseError::MissingArguments {
                     context: "click".to_string(),
-                    usage: "click <selector> [--new-tab]",
+                    usage: "click <selector> [--new-tab] [--human]",
                 })?;
+            let mut cmd = json!({ "id": id, "action": "click", "selector": sel });
             if new_tab {
-                Ok(json!({ "id": id, "action": "click", "selector": sel, "newTab": true }))
-            } else {
-                Ok(json!({ "id": id, "action": "click", "selector": sel }))
+                cmd["newTab"] = json!(true);
             }
+            if human {
+                cmd["inputMode"] = json!("human");
+            }
+            Ok(cmd)
         }
         "dblclick" => {
             let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
@@ -554,7 +558,11 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 context: "drag".to_string(),
                 usage: "drag <source> <target>",
             })?;
-            Ok(json!({ "id": id, "action": "drag", "source": src, "target": tgt }))
+            let mut cmd = json!({ "id": id, "action": "drag", "source": src, "target": tgt });
+            if rest.contains(&"--human") {
+                cmd["inputMode"] = json!("human");
+            }
+            Ok(cmd)
         }
         "upload" => {
             let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
@@ -1677,7 +1685,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     "recording_start",
                     &rest[1..],
                     "record start",
-                    "record start <output.webm> [url] [--fps <n>]",
+                    "record start <output.webm> [url] [--fps <n>] [--cursor] [--contact-sheet] [--contact-sheet-threshold <0-1>]",
                 ),
                 Some("stop") => Ok(json!({ "id": id, "action": "recording_stop" })),
                 Some("restart") => parse_record_take(
@@ -1685,7 +1693,7 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     "recording_restart",
                     &rest[1..],
                     "record restart",
-                    "record restart <output.webm> [url] [--fps <n>]",
+                    "record restart <output.webm> [url] [--fps <n>] [--cursor] [--contact-sheet] [--contact-sheet-threshold <0-1>]",
                 ),
                 Some(sub) => Err(ParseError::UnknownSubcommand {
                     subcommand: sub.to_string(),
@@ -2322,7 +2330,8 @@ fn parse_read(rest: &[&str], id: &str, flags: &Flags) -> Result<Value, ParseErro
 }
 
 /// Parse the arguments shared by `record start` and `record restart`:
-/// `<path> [url] [--fps <n>]`.
+/// `<path> [url] [--fps <n>] [--cursor] [--contact-sheet]` plus an optional
+/// contact-sheet pixel-difference threshold.
 ///
 /// `rest` excludes the subcommand. Recording defaults to
 /// `recording::DEFAULT_FPS`; `--fps` accepts anything up to
@@ -2338,6 +2347,9 @@ fn parse_record_take(
     let mut path: Option<&str> = None;
     let mut url: Option<&str> = None;
     let mut fps: Option<u32> = None;
+    let mut cursor = false;
+    let mut contact_sheet = false;
+    let mut contact_sheet_threshold: Option<f64> = None;
 
     let mut i = 0;
     while i < rest.len() {
@@ -2363,6 +2375,41 @@ fn parse_record_take(
                     });
                 }
                 fps = Some(parsed);
+                i += 2;
+            }
+            "--cursor" => {
+                cursor = true;
+                i += 1;
+            }
+            "--contact-sheet" => {
+                contact_sheet = true;
+                i += 1;
+            }
+            "--contact-sheet-threshold" => {
+                let value = rest
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError::MissingArguments {
+                        context: format!("{} --contact-sheet-threshold", context),
+                        usage,
+                    })?;
+                let parsed = value.parse::<f64>().map_err(|_| ParseError::InvalidValue {
+                    message: format!(
+                        "Invalid contact sheet threshold: '{}' is not a number",
+                        value
+                    ),
+                    usage,
+                })?;
+                if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+                    return Err(ParseError::InvalidValue {
+                        message: format!(
+                            "Invalid contact sheet threshold: {} is out of range (valid range: 0-1)",
+                            parsed
+                        ),
+                        usage,
+                    });
+                }
+                contact_sheet = true;
+                contact_sheet_threshold = Some(parsed);
                 i += 2;
             }
             flag if flag.starts_with("--") => {
@@ -2394,16 +2441,20 @@ fn parse_record_take(
 
     let mut cmd = json!({ "id": id, "action": action, "path": path });
     if let Some(u) = url {
-        // Add https:// prefix if needed (preserve special schemes)
-        let url_str = if u.starts_with("http") || u.contains("://") {
-            u.to_string()
-        } else {
-            format!("https://{}", u)
-        };
+        let url_str = normalize_navigation_url(u);
         cmd["url"] = json!(url_str);
     }
     if let Some(rate) = fps {
         cmd["fps"] = json!(rate);
+    }
+    if cursor {
+        cmd["cursor"] = json!(true);
+    }
+    if contact_sheet {
+        cmd["contactSheet"] = json!(true);
+    }
+    if let Some(threshold) = contact_sheet_threshold {
+        cmd["contactSheetThreshold"] = json!(threshold);
     }
     Ok(cmd)
 }
@@ -3059,7 +3110,32 @@ fn parse_mouse(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                     context: "mouse move".to_string(),
                     usage: "mouse move <x> <y>",
                 })?;
-            Ok(json!({ "id": id, "action": "mousemove", "x": x, "y": y }))
+            let mut cmd = json!({ "id": id, "action": "mousemove", "x": x, "y": y });
+            let mut i = 3;
+            while i < rest.len() {
+                match rest[i] {
+                    "--duration" | "--steps" | "--seed" => {
+                        let flag = rest[i];
+                        let raw = rest.get(i + 1).ok_or_else(|| ParseError::MissingArguments {
+                            context: format!("mouse move {}", flag),
+                            usage: "mouse move <x> <y> [--duration <ms>] [--steps <n>] [--seed <n>]",
+                        })?;
+                        let value = raw.parse::<u64>().map_err(|_| ParseError::InvalidValue {
+                            message: format!("{} expects a non-negative integer, got '{}'", flag, raw),
+                            usage: "mouse move <x> <y> [--duration <ms>] [--steps <n>] [--seed <n>]",
+                        })?;
+                        let key = match flag { "--duration" => "duration", "--steps" => "steps", _ => "seed" };
+                        cmd[key] = json!(value);
+                        i += 2;
+                    }
+                    "--human" => { cmd["inputMode"] = json!("human"); i += 1; }
+                    other => return Err(ParseError::InvalidValue {
+                        message: format!("unexpected argument '{}'", other),
+                        usage: "mouse move <x> <y> [--duration <ms>] [--steps <n>] [--seed <n>] [--human]",
+                    }),
+                }
+            }
+            Ok(cmd)
         }
         Some("down") => {
             Ok(json!({ "id": id, "action": "mousedown", "button": rest.get(1).unwrap_or(&"left") }))
@@ -3482,6 +3558,7 @@ mod tests {
             cli_no_webmcp: false,
             cli_restore: false,
             cli_pin_tab: false,
+            cli_input_mode: false,
             annotate: false,
             color_scheme: None,
             download_path: None,
@@ -3502,6 +3579,7 @@ mod tests {
             plugins: Vec::new(),
             verbose: false,
             quiet: false,
+            input_mode: "instant".to_string(),
         }
     }
 
@@ -4303,6 +4381,26 @@ mod tests {
     }
 
     #[test]
+    fn test_click_human() {
+        let cmd = parse_command(&args("click @e1 --human"), &default_flags()).unwrap();
+        assert_eq!(cmd["selector"], "@e1");
+        assert_eq!(cmd["inputMode"], "human");
+    }
+
+    #[test]
+    fn test_mouse_move_interpolation_options() {
+        let cmd = parse_command(
+            &args("mouse move 600 400 --duration 250 --steps 24 --seed 42 --human"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["duration"], 250);
+        assert_eq!(cmd["steps"], 24);
+        assert_eq!(cmd["seed"], 42);
+        assert_eq!(cmd["inputMode"], "human");
+    }
+
+    #[test]
     fn test_fill() {
         let cmd = parse_command(&args("fill #input hello world"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "fill");
@@ -4864,6 +4962,50 @@ mod tests {
         assert_eq!(cmd["action"], "recording_start");
         assert_eq!(cmd["path"], "output.webm");
         assert_eq!(cmd["fps"], 60);
+    }
+
+    #[test]
+    fn test_record_start_with_cursor() {
+        let cmd =
+            parse_command(&args("record start output.webm --cursor"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "recording_start");
+        assert_eq!(cmd["cursor"], true);
+    }
+
+    #[test]
+    fn test_record_start_with_contact_sheet() {
+        let cmd = parse_command(
+            &args("record start output.webm --contact-sheet --contact-sheet-threshold 0.12"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["contactSheet"], true);
+        assert_eq!(cmd["contactSheetThreshold"], 0.12);
+    }
+
+    #[test]
+    fn test_record_start_threshold_implies_contact_sheet() {
+        let cmd = parse_command(
+            &args("record start output.webm --contact-sheet-threshold 0.01"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["contactSheet"], true);
+        assert_eq!(cmd["contactSheetThreshold"], 0.01);
+    }
+
+    #[test]
+    fn test_record_start_rejects_invalid_contact_sheet_threshold() {
+        for value in ["-0.1", "1.1", "many"] {
+            let result = parse_command(
+                &args(&format!(
+                    "record start output.webm --contact-sheet-threshold {}",
+                    value
+                )),
+                &default_flags(),
+            );
+            assert!(result.is_err(), "threshold {value} should fail");
+        }
     }
 
     #[test]

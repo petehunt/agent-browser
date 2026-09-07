@@ -850,7 +850,8 @@ fn tools() -> Vec<Value> {
             "Click an element by @ref or CSS selector.",
             json!({
                 "selector": selector_schema(),
-                "newTab": { "type": "boolean", "default": false, "description": "Open link targets in a new tab." }
+                "newTab": { "type": "boolean", "default": false, "description": "Open link targets in a new tab." },
+                "human": { "type": "boolean", "default": false, "description": "Approach the target with seeded, curved mouse movement before clicking." }
             }),
             &["selector"],
         ),
@@ -982,7 +983,7 @@ fn parity_tools() -> Vec<Value> {
             TOOL_DRAG,
             "Drag and drop",
             "Drag one element to another.",
-            json!({ "source": selector_schema(), "target": selector_schema() }),
+            json!({ "source": selector_schema(), "target": selector_schema(), "human": { "type": "boolean", "default": false, "description": "Use seeded, curved mouse movement." } }),
             &["source", "target"],
         ),
         tool(
@@ -1108,8 +1109,15 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_MOUSE_MOVE,
             "Mouse move",
-            "Move the mouse.",
-            json!({ "x": number_schema(), "y": number_schema() }),
+            "Move the mouse. Interpolation starts at the last pointer or element interaction.",
+            json!({
+                "x": number_schema(),
+                "y": number_schema(),
+                "durationMs": { "type": "integer", "minimum": 0, "description": "Total movement duration in milliseconds." },
+                "steps": { "type": "integer", "minimum": 1, "maximum": 240, "description": "Number of interpolated events." },
+                "human": { "type": "boolean", "default": false, "description": "Add a seeded perpendicular curve." },
+                "seed": { "type": "integer", "minimum": 0, "description": "Seed for reproducible human movement." }
+            }),
             &["x", "y"],
         ),
         tool(
@@ -1378,6 +1386,9 @@ fn parity_tools() -> Vec<Value> {
                     "maximum": crate::native::recording::MAX_FPS,
                     "description": "Capture rate in frames per second (default 30, max 60).",
                 },
+                "cursor": { "type": "boolean", "description": "Show an animated pointer in the recording." },
+                "contactSheet": { "type": "boolean", "description": "Export first, changed, and final frames as a timestamped PNG beside the video." },
+                "contactSheetThreshold": { "type": "number", "minimum": 0, "maximum": 1, "description": "Changed-pixel ratio required to select a contact-sheet frame (default 0.05). Implies contactSheet." },
             }),
             &["path"],
         ),
@@ -1401,6 +1412,9 @@ fn parity_tools() -> Vec<Value> {
                     "maximum": crate::native::recording::MAX_FPS,
                     "description": "Capture rate in frames per second (default 30, max 60).",
                 },
+                "cursor": { "type": "boolean", "description": "Show an animated pointer in the recording." },
+                "contactSheet": { "type": "boolean", "description": "Export first, changed, and final frames as a timestamped PNG beside the video." },
+                "contactSheetThreshold": { "type": "number", "minimum": 0, "maximum": 1, "description": "Changed-pixel ratio required to select a contact-sheet frame (default 0.05). Implies contactSheet." },
             }),
             &["path"],
         ),
@@ -2605,6 +2619,9 @@ fn click_command_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     if optional_bool(arguments, "newTab")?.unwrap_or(false) {
         args.push("--new-tab".to_string());
     }
+    if optional_bool(arguments, "human")?.unwrap_or(false) {
+        args.push("--human".to_string());
+    }
     Ok(args)
 }
 
@@ -2640,7 +2657,11 @@ fn call_press(arguments: &Value) -> Result<Value, ProtocolError> {
 fn call_drag(arguments: &Value) -> Result<Value, ProtocolError> {
     let source = required_string(arguments, "source")?;
     let target = required_string(arguments, "target")?;
-    call_cli_tool(arguments, vec!["drag".to_string(), source, target], None)
+    let mut args = vec!["drag".to_string(), source, target];
+    if optional_bool(arguments, "human")?.unwrap_or(false) {
+        args.push("--human".to_string());
+    }
+    call_cli_tool(arguments, args, None)
 }
 
 fn call_upload(arguments: &Value) -> Result<Value, ProtocolError> {
@@ -2810,11 +2831,21 @@ fn call_find(arguments: &Value) -> Result<Value, ProtocolError> {
 fn call_mouse_move(arguments: &Value) -> Result<Value, ProtocolError> {
     let x = required_number_string(arguments, "x")?;
     let y = required_number_string(arguments, "y")?;
-    call_cli_tool(
-        arguments,
-        vec!["mouse".to_string(), "move".to_string(), x, y],
-        None,
-    )
+    let mut args = vec!["mouse".to_string(), "move".to_string(), x, y];
+    for (field, flag) in [
+        ("durationMs", "--duration"),
+        ("steps", "--steps"),
+        ("seed", "--seed"),
+    ] {
+        if let Some(value) = optional_u64(arguments, field)? {
+            args.push(flag.to_string());
+            args.push(value.to_string());
+        }
+    }
+    if optional_bool(arguments, "human")?.unwrap_or(false) {
+        args.push("--human".to_string());
+    }
+    call_cli_tool(arguments, args, None)
 }
 
 fn call_mouse_button(arguments: &Value, action: &str) -> Result<Value, ProtocolError> {
@@ -3079,6 +3110,16 @@ fn record_command_args(arguments: &Value, action: &str) -> Result<Vec<String>, P
     if let Some(fps) = optional_u64(arguments, "fps")? {
         args.push("--fps".to_string());
         args.push(fps.to_string());
+    }
+    if optional_bool(arguments, "cursor")?.unwrap_or(false) {
+        args.push("--cursor".to_string());
+    }
+    if optional_bool(arguments, "contactSheet")?.unwrap_or(false) {
+        args.push("--contact-sheet".to_string());
+    }
+    if let Some(threshold) = optional_number_string(arguments, "contactSheetThreshold")? {
+        args.push("--contact-sheet-threshold".to_string());
+        args.push(threshold);
     }
     Ok(args)
 }
@@ -4546,7 +4587,20 @@ mod tests {
     }
 
     #[test]
-    fn record_schema_and_args_include_fps() {
+    fn record_urls_preserve_navigation_schemes() {
+        for url in ["data:text/html,hello", "about:blank", "https://example.com"] {
+            let args =
+                record_command_args(&json!({"path": "demo.webm", "url": url}), "start").unwrap();
+            let flags = crate::flags::parse_flags(&args);
+            assert_eq!(
+                crate::commands::parse_command(&args, &flags).unwrap()["url"],
+                url
+            );
+        }
+    }
+
+    #[test]
+    fn record_schema_and_args_match_cli_options() {
         for name in [TOOL_RECORD_START, TOOL_RECORD_RESTART] {
             let tool = tools()
                 .into_iter()
@@ -4557,6 +4611,17 @@ mod tests {
             assert_eq!(fps["minimum"], json!(1));
             // Must stay in sync with the CLI parser's --fps ceiling.
             assert_eq!(fps["maximum"], json!(crate::native::recording::MAX_FPS));
+            assert_eq!(
+                tool["inputSchema"]["properties"]["cursor"]["type"],
+                "boolean"
+            );
+            assert_eq!(
+                tool["inputSchema"]["properties"]["contactSheet"]["type"],
+                "boolean"
+            );
+            let threshold = &tool["inputSchema"]["properties"]["contactSheetThreshold"];
+            assert_eq!(threshold["minimum"], json!(0));
+            assert_eq!(threshold["maximum"], json!(1));
         }
 
         assert_eq!(
@@ -4582,6 +4647,29 @@ mod tests {
         assert_eq!(
             record_command_args(&json!({ "path": "demo.webm" }), "start").unwrap(),
             vec!["record", "start", "demo.webm"]
+        );
+        assert_eq!(
+            record_command_args(&json!({ "path": "demo.webm", "cursor": true }), "start").unwrap(),
+            vec!["record", "start", "demo.webm", "--cursor"]
+        );
+        assert_eq!(
+            record_command_args(
+                &json!({
+                    "path": "demo.webm",
+                    "contactSheet": true,
+                    "contactSheetThreshold": 0.08
+                }),
+                "start"
+            )
+            .unwrap(),
+            vec![
+                "record",
+                "start",
+                "demo.webm",
+                "--contact-sheet",
+                "--contact-sheet-threshold",
+                "0.08"
+            ]
         );
     }
 

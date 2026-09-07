@@ -7406,10 +7406,8 @@ async fn e2e_recording_default_with_url_navigates_active_tab() {
 // Recording: requested frame rate
 // ---------------------------------------------------------------------------
 
-/// Verify that `recording_start` honors an explicit frame rate and that the
-/// frame count tracks wall clock. Screencast frames arrive only when the page
-/// repaints, and the ticker holds the last frame through gaps, so roughly
-/// `fps * seconds` frames must reach ffmpeg even for a static page.
+/// Verify that a requested frame rate sets the timestamp resolution without
+/// filling a static recording with duplicate encoded frames.
 #[tokio::test]
 #[ignore]
 async fn e2e_recording_honors_requested_fps() {
@@ -7466,21 +7464,36 @@ async fn e2e_recording_honors_requested_fps() {
     assert_eq!(data["fps"].as_u64(), Some(FPS));
 
     let frames = data["frames"].as_u64().unwrap();
-    let expected = FPS * RECORD_MS / 1000;
     assert!(
-        frames >= expected / 2 && frames <= expected * 2,
-        "expected roughly {expected} frames at {FPS} fps over {RECORD_MS}ms, got {frames}"
+        (2..FPS / 4).contains(&frames),
+        "static page should use sparse frames at {FPS} fps, got {frames}"
     );
-    // A static page repaints once, so the file is one captured frame held
-    // for the whole take.
     let captured = data["capturedFrames"].as_u64().unwrap();
-    assert!(
-        (1..frames).contains(&captured),
-        "static page should yield a few captured frames held across {frames} written, got {captured}"
-    );
+    assert!(captured >= 1, "static page should produce an initial frame");
 
     let size = std::fs::metadata(&rec_path).map(|m| m.len()).unwrap_or(0);
     assert!(size > 0, "recording file should not be empty");
+    let probe = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(&rec_path)
+        .output()
+        .expect("ffprobe should inspect the recording");
+    assert!(probe.status.success());
+    let duration: f64 = String::from_utf8_lossy(&probe.stdout)
+        .trim()
+        .parse()
+        .expect("ffprobe duration should be numeric");
+    assert!(
+        (0.8..1.5).contains(&duration),
+        "sparse recording should retain wall-clock duration, got {duration}"
+    );
 
     let _ = std::fs::remove_file(&rec_path);
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
@@ -7531,6 +7544,127 @@ async fn e2e_recording_rejects_invalid_fps() {
     .await;
     assert_eq!(resp.get("success").and_then(|v| v.as_bool()), Some(false));
 
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// Verify the composited pointer and changed-frame contact sheet through the
+/// full daemon pipeline.
+#[tokio::test]
+#[ignore]
+async fn e2e_recording_cursor_and_contact_sheet() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let html = r#"data:text/html,<style>body{margin:0;background:%23f3f4f6;font-family:sans-serif}.card{margin:80px;padding:48px;background:white;border-radius:24px}button{padding:18px 28px;background:%232563eb;color:white;border:0;border-radius:12px}</style><div class=card><h1>Contact sheet demo</h1><p>Review important visual changes at a glance.</p><button>Continue</button></div>"#;
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": html }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let rec_path = std::env::temp_dir().join(format!(
+        "ab-e2e-rec-contact-sheet-{}.webm",
+        std::process::id()
+    ));
+    let sheet_path = rec_path.with_file_name(format!(
+        "{}.contact-sheet.png",
+        rec_path.file_stem().unwrap().to_string_lossy()
+    ));
+    let resp = execute_command(
+        &json!({
+            "id": "3",
+            "action": "recording_start",
+            "path": rec_path.to_string_lossy(),
+            "cursor": true,
+            "contactSheet": true,
+            "contactSheetThreshold": 0.01
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["cursor"], true);
+    assert_eq!(get_data(&resp)["contactSheet"], true);
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "evaluate", "script": "Boolean(document.getElementById('__agent_browser_recording_cursor__'))" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], false);
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "mousemove", "x": 360, "y": 260 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let cursor = state
+        .recording_state
+        .shared_cursor
+        .lock()
+        .unwrap()
+        .at(super::recording::cursor_timestamp());
+    assert!(cursor.visible);
+    assert_eq!((cursor.x, cursor.y), (360.0, 260.0));
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "evaluate", "script": "document.querySelector('.card').style.background='#dbeafe'; document.querySelector('h1').textContent='Ready to continue'; true" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
+    let resp = execute_command(
+        &json!({ "id": "7", "action": "evaluate", "script": "document.querySelector('.card').style.background='#dcfce7'; document.querySelector('p').textContent='The important region is highlighted.'; true" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
+
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "recording_stop" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let data = get_data(&resp);
+    assert_eq!(
+        data["contactSheetPath"],
+        sheet_path.to_string_lossy().as_ref()
+    );
+    assert!(data["contactSheetFrames"].as_u64().unwrap_or(0) >= 2);
+    assert!(std::fs::metadata(&rec_path).unwrap().len() > 0);
+    let sheet = image::open(&sheet_path).expect("contact sheet should be a valid PNG");
+    assert!(sheet.width() >= 320);
+    assert!(sheet.height() >= 150);
+    if let Some(example_path) = std::env::var_os("AGENT_BROWSER_CONTACT_SHEET_EXAMPLE_PATH") {
+        let example_path = std::path::PathBuf::from(example_path);
+        if let Some(parent) = example_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::copy(&sheet_path, example_path).unwrap();
+    }
+
+    let resp = execute_command(
+        &json!({ "id": "9", "action": "evaluate", "script": "Boolean(document.getElementById('__agent_browser_recording_cursor__'))" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], false);
+
+    let _ = std::fs::remove_file(&rec_path);
+    let _ = std::fs::remove_file(&sheet_path);
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
 }
@@ -10097,4 +10231,47 @@ async fn e2e_find_role_document_matches_root() {
     assert_success(&resp);
 
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_mouse_interpolation_starts_at_last_element_interaction() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(
+            &json!({"id": "1", "action": "launch", "headless": true}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(&execute_command(&json!({"id": "2", "action": "setcontent", "html": "<button id='b' style='position:absolute;left:400px;top:300px;width:100px;height:40px'>Target</button><input id='c' type='checkbox' style='position:absolute;left:200px;top:200px'>"}), &mut state).await);
+    for action in ["click", "hover", "dblclick", "check", "uncheck"] {
+        let selector = if matches!(action, "check" | "uncheck") {
+            "#c"
+        } else {
+            "#b"
+        };
+        assert_success(
+            &execute_command(
+                &json!({"id": "3", "action": action, "selector": selector}),
+                &mut state,
+            )
+            .await,
+        );
+        let start = (state.mouse_state.x, state.mouse_state.y);
+        assert!(start.0 >= 200.0 && start.1 >= 200.0, "{action}: {start:?}");
+        assert_success(&execute_command(&json!({"id": "4", "action": "evaluate", "script": "window.moves=[];document.onmousemove=e=>moves.push([e.clientX,e.clientY]);"}), &mut state).await);
+        assert_success(&execute_command(&json!({"id": "5", "action": "mousemove", "x": start.0 + 100.0, "y": start.1, "steps": 2}), &mut state).await);
+        let result = execute_command(
+            &json!({"id": "6", "action": "evaluate", "script": "moves"}),
+            &mut state,
+        )
+        .await;
+        assert_success(&result);
+        let moves = get_data(&result)["result"].as_array().unwrap();
+        assert_eq!(moves.len(), 2, "{action}: {moves:?}");
+        assert!((moves[0][0].as_f64().unwrap() - (start.0 + 50.0)).abs() <= 1.0);
+        assert!((moves[1][0].as_f64().unwrap() - (start.0 + 100.0)).abs() <= 1.0);
+    }
+    assert_success(&execute_command(&json!({"id": "99", "action": "close"}), &mut state).await);
 }

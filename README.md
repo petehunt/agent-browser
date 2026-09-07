@@ -132,6 +132,8 @@ agent-browser drag <src> <tgt>        # Drag and drop
 agent-browser upload <sel> <files>    # Upload files
 agent-browser screenshot [path]       # Take screenshot (--full for full page, saves to a temporary directory if no path)
 agent-browser screenshot --annotate   # Annotated screenshot with numbered element labels
+agent-browser screenshot --if-changed # Recommended: skip unchanged images to save tokens
+agent-browser screenshot --threshold 0.01 # Ignore changes affecting at most 1% of pixels
 agent-browser screenshot --screenshot-dir ./shots    # Save to custom directory
 agent-browser screenshot --screenshot-format jpeg --screenshot-quality 80
 agent-browser pdf <path>              # Save as PDF
@@ -924,7 +926,9 @@ Do not put vault tokens or passwords in plugin command args. Use the vault vendo
 
 ## Snapshot Options
 
-The `snapshot` command supports filtering to reduce output size:
+Existing elements keep their refs across snapshots. Take a fresh snapshot after navigation.
+
+Use filters to reduce snapshot output:
 
 ```bash
 agent-browser snapshot                    # Full accessibility tree
@@ -934,6 +938,8 @@ agent-browser snapshot -c                 # Compact (remove empty structural ele
 agent-browser snapshot -d 3               # Limit depth to 3 levels
 agent-browser snapshot -s "#main"         # Scope to CSS selector
 agent-browser snapshot -i -c -d 5         # Combine options
+agent-browser snapshot --delta             # Full state, then bounded incremental updates
+agent-browser snapshot --delta --full      # Force full state and refresh the baseline
 ```
 
 | Option                 | Description                                                             |
@@ -943,6 +949,10 @@ agent-browser snapshot -i -c -d 5         # Combine options
 | `-c, --compact`        | Remove empty structural elements                                        |
 | `-d, --depth <n>`      | Limit tree depth                                                        |
 | `-s, --selector <sel>` | Scope to CSS selector                                                   |
+| `--delta`              | Return full state once, then `unchanged` or a structural JSON delta     |
+| `--full`               | Force full state and update the delta baseline                          |
+
+`--delta` returns `full`, `unchanged`, or incremental updates per tab and option set. It falls back to full state after URL changes or when a delta would not save space. See the [delta response format](skill-data/core/references/commands.md#snapshot-page-analysis) for applying updates.
 
 ## Annotated Screenshots
 
@@ -999,6 +1009,8 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--device <name>` | iOS device name, e.g. "iPhone 15 Pro" (or `AGENT_BROWSER_IOS_DEVICE` env) |
 | `--json` | JSON output (for agents) |
 | `--annotate` | Annotated screenshot with numbered element labels (or `AGENT_BROWSER_ANNOTATE` env) |
+| `--if-changed` | Recommended for repeated captures: skip unchanged images to save tokens (history is per tab and scope) |
+| `--threshold <0-1>` | Maximum changed-pixel ratio treated as unchanged; implies `--if-changed` |
 | `--screenshot-dir <path>` | Default screenshot output directory (or `AGENT_BROWSER_SCREENSHOT_DIR` env) |
 | `--screenshot-quality <n>` | JPEG quality 0-100 (or `AGENT_BROWSER_SCREENSHOT_QUALITY` env) |
 | `--screenshot-format <fmt>` | Screenshot format: `png`, `jpeg` (or `AGENT_BROWSER_SCREENSHOT_FORMAT` env) |

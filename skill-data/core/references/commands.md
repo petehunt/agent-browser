@@ -48,7 +48,11 @@ agent-browser snapshot -i         # Interactive elements only (recommended)
 agent-browser snapshot -c         # Compact output
 agent-browser snapshot -d 3       # Limit depth to 3
 agent-browser snapshot -s "#main" # Scope to CSS selector
+agent-browser snapshot --delta     # Full state once, then bounded structural deltas
+agent-browser snapshot --delta --full # Force full state and refresh baseline
 ```
+
+Delta history is per tab and option set. Responses are `full`, `unchanged`, or `delta`; URL changes or large deltas return full state. For a delta, apply `changes` (`add`, `remove`, `replace`) to ref metadata. Split the previous tree on newlines, splice `treeChange.lines` at zero-based `startLine`, replacing `deleteCount` lines, then join with newlines. Apply both parts to `baseRevision` before advancing to `revision`; use `--full` if the baseline is unavailable.
 
 ## Interactions (use @refs from snapshot)
 
@@ -105,8 +109,12 @@ agent-browser is checked @e1      # Check if checked
 agent-browser screenshot          # Save to temporary directory
 agent-browser screenshot path.png # Save to specific path
 agent-browser screenshot --full   # Full page
+agent-browser screenshot --if-changed # Recommended: skip unchanged images to save tokens
+agent-browser screenshot --threshold 0.01 # Ignore changes affecting at most 1% of pixels
 agent-browser pdf output.pdf      # Save as PDF
 ```
+
+`--threshold <0-1>` implies `--if-changed`. Conditional history is isolated by tab and capture scope. JSON responses include `changed`, `revision`, `pixelChangeRatio`, and `threshold`; `path` is present only when the change exceeds the threshold. The first capture for a scope is always changed.
 
 Headless Chromium screenshots hide native scrollbars for consistent image output. Pass `--hide-scrollbars false` when launching to keep native scrollbars visible.
 

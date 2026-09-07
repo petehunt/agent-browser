@@ -834,13 +834,15 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_SNAPSHOT,
             "Snapshot page",
-            "Return an accessibility-tree snapshot with stable element refs.",
+            "Return an accessibility-tree snapshot with stable element refs. Refresh after navigation.",
             json!({
                 "interactive": { "type": "boolean", "default": true, "description": "Only include interactive elements." },
                 "compact": { "type": "boolean", "default": false, "description": "Remove empty structural elements." },
                 "depth": { "type": "integer", "minimum": 0, "description": "Limit tree depth." },
                 "selector": { "type": "string", "description": "Scope the snapshot to a CSS selector." },
-                "includeUrls": { "type": "boolean", "default": false, "description": "Include href URLs on links." }
+                "includeUrls": { "type": "boolean", "default": false, "description": "Include href URLs on links." },
+                "delta": { "type": "boolean", "default": false, "description": "Return full state once, then unchanged or bounded structural deltas. Apply changes to refs and treeChange (zero-based startLine, deleteCount, lines) to the previous tree." },
+                "full": { "type": "boolean", "default": false, "description": "Force full state while updating the delta baseline." }
             }),
             &[],
         ),
@@ -934,7 +936,9 @@ fn tools() -> Vec<Value> {
                 "annotate": { "type": "boolean", "default": false, "description": "Number visible elements in the screenshot." },
                 "format": { "type": "string", "enum": ["png", "jpeg"], "description": "Screenshot format." },
                 "quality": { "type": "integer", "minimum": 0, "maximum": 100, "description": "JPEG quality." },
-                "screenshotDir": { "type": "string", "description": "Default output directory when path is omitted." }
+                "screenshotDir": { "type": "string", "description": "Default output directory when path is omitted." },
+                "ifChanged": { "type": "boolean", "default": false, "description": "Recommended for repeated captures to save tokens: return image content only when pixels changed." },
+                "threshold": { "type": "number", "minimum": 0, "maximum": 1, "description": "Maximum changed-pixel ratio to treat as unchanged. Implies ifChanged." }
             }),
             &[],
         ),
@@ -2604,6 +2608,12 @@ fn call_snapshot(arguments: &Value) -> Result<Value, ProtocolError> {
         args.push("-s".to_string());
         args.push(selector);
     }
+    if optional_bool(arguments, "delta")?.unwrap_or(false) {
+        args.push("--delta".to_string());
+    }
+    if optional_bool(arguments, "full")?.unwrap_or(false) {
+        args.push("--full".to_string());
+    }
 
     call_cli_tool(arguments, args, None)
 }
@@ -2765,6 +2775,13 @@ fn call_screenshot(arguments: &Value) -> Result<Value, ProtocolError> {
     }
     if optional_bool(arguments, "fullPage")?.unwrap_or(false) {
         args.push("--full".to_string());
+    }
+    if optional_bool(arguments, "ifChanged")?.unwrap_or(false) {
+        args.push("--if-changed".to_string());
+    }
+    if let Some(threshold) = optional_number_string(arguments, "threshold")? {
+        args.push("--threshold".to_string());
+        args.push(threshold);
     }
     call_cli_tool(arguments, args, None)
 }
@@ -4815,5 +4832,29 @@ mod tests {
     fn initialize_defaults_to_latest_protocol_version() {
         let result = initialize_result(None, &McpConfig::default());
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_delta_schema_tests {
+    use super::*;
+    #[test]
+    fn delta_schema_explains_lossless_tree_patch() {
+        let snapshot = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == TOOL_SNAPSHOT)
+            .unwrap();
+        assert!(
+            snapshot["inputSchema"]["properties"]["delta"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("treeChange")
+        );
+        let args = vec!["snapshot".to_string(), "--delta".to_string()];
+        let flags = crate::flags::parse_flags(&args);
+        assert_eq!(
+            crate::commands::parse_command(&args, &flags).unwrap()["delta"],
+            true
+        );
     }
 }

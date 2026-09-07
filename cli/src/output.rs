@@ -2127,8 +2127,7 @@ Returns an accessibility tree representation of the page with element
 references (like @e1, @e2) that can be used in subsequent commands.
 DOM-backed references remain stable across observations while their nodes
 survive. Removed references are reported in JSON and IDs are never recycled
-within the browser session. Snapshot and URL content diffs ignore generated
-ref annotations while captured snapshots retain their actionable refs.
+within the browser session. Content diffs ignore generated ref IDs.
 
 Options:
   -i, --interactive    Only include interactive elements

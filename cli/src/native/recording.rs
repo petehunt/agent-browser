@@ -1399,7 +1399,7 @@ struct CapturedVideoFrame {
 
 async fn seed_recording_outputs(
     frame_tx: &mpsc::Sender<CapturedVideoFrame>,
-    contact_tx: Option<&std::sync::mpsc::SyncSender<CapturedVideoFrame>>,
+    contact_tx: Option<&std::sync::mpsc::SyncSender<(CapturedVideoFrame, tokio::time::Instant)>>,
     frame: CapturedVideoFrame,
 ) -> Result<(), String> {
     frame_tx
@@ -1407,15 +1407,7 @@ async fn seed_recording_outputs(
         .await
         .map_err(|_| "Recording encoder stopped unexpectedly".to_string())?;
     if let Some(contact_tx) = contact_tx {
-        contact_tx.try_send(frame).map_err(|error| match error {
-            std::sync::mpsc::TrySendError::Full(_) => format!(
-                "Contact sheet analyzer fell behind by more than {} buffered frames",
-                ENCODER_FRAME_BUFFER
-            ),
-            std::sync::mpsc::TrySendError::Disconnected(_) => {
-                "Contact sheet analyzer stopped unexpectedly".to_string()
-            }
-        })?;
+        send_contact_frame(contact_tx, frame)?;
     }
     Ok(())
 }
@@ -1702,13 +1694,16 @@ async fn collect_frames(
 }
 
 struct ContactFrameSink {
-    tx: std::sync::mpsc::SyncSender<CapturedVideoFrame>,
+    tx: std::sync::mpsc::SyncSender<(CapturedVideoFrame, tokio::time::Instant)>,
     governor: ContactFrameGovernor,
     pending: Option<CapturedVideoFrame>,
 }
 
 impl ContactFrameSink {
-    fn new(tx: std::sync::mpsc::SyncSender<CapturedVideoFrame>, fps: u32) -> Self {
+    fn new(
+        tx: std::sync::mpsc::SyncSender<(CapturedVideoFrame, tokio::time::Instant)>,
+        fps: u32,
+    ) -> Self {
         Self {
             tx,
             governor: ContactFrameGovernor::new(fps),
@@ -1758,23 +1753,25 @@ impl ContactFrameGovernor {
 }
 
 fn send_contact_frame(
-    contact_tx: &std::sync::mpsc::SyncSender<CapturedVideoFrame>,
+    contact_tx: &std::sync::mpsc::SyncSender<(CapturedVideoFrame, tokio::time::Instant)>,
     frame: CapturedVideoFrame,
 ) -> Result<(), String> {
-    contact_tx.try_send(frame).map_err(|error| match error {
-        std::sync::mpsc::TrySendError::Full(_) => format!(
-            "Contact sheet analyzer fell behind by more than {} buffered frames",
-            ENCODER_FRAME_BUFFER
-        ),
-        std::sync::mpsc::TrySendError::Disconnected(_) => {
-            "Contact sheet analyzer stopped unexpectedly".to_string()
-        }
-    })
+    contact_tx
+        .try_send((frame, tokio::time::Instant::now()))
+        .map_err(|error| match error {
+            std::sync::mpsc::TrySendError::Full(_) => format!(
+                "Contact sheet analyzer fell behind by more than {} buffered frames",
+                ENCODER_FRAME_BUFFER
+            ),
+            std::sync::mpsc::TrySendError::Disconnected(_) => {
+                "Contact sheet analyzer stopped unexpectedly".to_string()
+            }
+        })
 }
 
 /// Analyze frames and render finalized cells on the blocking worker.
 fn collect_contact_frames(
-    frames: std::sync::mpsc::Receiver<CapturedVideoFrame>,
+    frames: std::sync::mpsc::Receiver<(CapturedVideoFrame, tokio::time::Instant)>,
     threshold: f64,
     cursor: bool,
     shared_cursor: &SharedRecordingCursor,
@@ -1783,14 +1780,15 @@ fn collect_contact_frames(
     let mut max_lag = Duration::ZERO;
     let mut processed = 0u64;
     loop {
-        let frame = match frames.recv_timeout(Duration::from_millis(CONTACT_SHEET_BURST_QUIET_MS)) {
-            Ok(frame) => frame,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                collector.flush_pending();
-                continue;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        };
+        let (frame, queued_at) =
+            match frames.recv_timeout(Duration::from_millis(CONTACT_SHEET_BURST_QUIET_MS)) {
+                Ok(frame) => frame,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    collector.flush_pending();
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
         let cursor_state = if cursor {
             shared_cursor
                 .lock()
@@ -1807,7 +1805,7 @@ fn collect_contact_frames(
             frame.device_height,
         );
         // Measure through completed selection/rendering, not just dequeue.
-        let lag = frame.captured_at.elapsed();
+        let lag = queued_at.elapsed();
         max_lag = max_lag.max(lag);
         processed += 1;
         if lag > MAX_ENCODER_LAG {
@@ -3117,7 +3115,7 @@ mod tests {
 
         assert_eq!(
             rx.try_iter()
-                .map(|frame| frame.sequence)
+                .map(|(frame, _)| frame.sequence)
                 .collect::<Vec<_>>(),
             vec![2, 4, 5]
         );

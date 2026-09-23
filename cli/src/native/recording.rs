@@ -3123,6 +3123,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn quiet_page_final_frame_does_not_count_governor_wait_as_analysis_lag() {
+        let image = image::RgbImage::from_pixel(64, 64, image::Rgb([12, 34, 56]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut sink = ContactFrameSink::new(tx, 1);
+        sink.consider(CapturedVideoFrame {
+            sequence: 1,
+            image_data: Arc::new(png.into_inner()),
+            elapsed: Duration::from_millis(100),
+            captured_at: tokio::time::Instant::now() - MAX_ENCODER_LAG - Duration::from_millis(1),
+            timestamp: 0.0,
+            device_width: 64.0,
+            device_height: 64.0,
+        })
+        .unwrap();
+        sink.finish().unwrap();
+
+        let cursor = Arc::new(Mutex::new(RecordingCursorHistory::default()));
+        let frames = collect_contact_frames(rx, DEFAULT_CONTACT_SHEET_THRESHOLD, false, &cursor)
+            .expect("an intentional FPS-governor wait must not count as analysis lag");
+        assert_eq!(frames.len(), 1);
+    }
+
     #[tokio::test]
     async fn test_spawn_ffmpeg_reports_missing_binary() {
         let mut command = tokio::process::Command::new("agent-browser-no-such-ffmpeg");
